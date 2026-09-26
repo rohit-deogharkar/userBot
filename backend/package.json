@@ -1,0 +1,29 @@
+{
+  "name": "userdexbot-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "fund": "node scripts/fund.js",
+    "e2e": "node scripts/e2e.js",
+    "start:testnet": "node --env-file=.env.testnet src/index.js",
+    "dev:testnet": "node --env-file=.env.testnet --watch src/index.js",
+    "testnet:setup": "node --env-file=.env.testnet scripts/testnet-setup.js",
+    "fund:testnet": "node --env-file=.env.testnet scripts/fund.js",
+    "e2e:testnet": "node --env-file=.env.testnet scripts/e2e.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^7.6.0",
+    "viem": "^2.56.9",
+    "zodiac-roles-sdk": "^4.1.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
