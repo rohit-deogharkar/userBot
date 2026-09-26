@@ -1,4 +1,14 @@
-import { createPublicClient, createWalletClient, custom, defineChain } from "viem";
+import { concat, createPublicClient, createWalletClient, custom, defineChain, getAddress, pad, parseAbi } from "viem";
+
+export const safeExecAbi = parseAbi([
+  "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool success)",
+]);
+
+/**
+ * The signature Safe accepts when the owner sends the transaction themselves.
+ * Safe checks the sender is the owner, so MetaMask shows one transaction and no separate signature.
+ */
+export const ownerSentSignature = (owner) => concat([pad(getAddress(owner)), pad("0x00"), "0x01"]);
 
 export const hasMetaMask = () => typeof window !== "undefined" && Boolean(window.ethereum);
 

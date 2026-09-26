@@ -6,7 +6,7 @@ export default function WithdrawForm({ config, busy, balances, onWithdraw }) {
     <section className="card">
       <h2>Withdraw</h2>
       <p className="muted">
-        Funds always go back to your own MetaMask. You sign in MetaMask, and we pay the network fee.
+        Funds always go back to your own MetaMask. You confirm in MetaMask and pay the small network fee.
       </p>
       <AmountForm
         id="withdraw"

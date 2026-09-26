@@ -6,13 +6,12 @@ import {
   getContractAddress,
   isAddressEqual,
   keccak256,
-  parseEventLogs,
 } from "viem";
 import { Clearance, flattenCondition, processPermissions } from "zodiac-roles-sdk";
 import { moduleProxyFactoryAbi, rolesAbi, safeAbi } from "./abis.js";
-import { botAccount, publicClient, relayerClient, relayerQueue, sendAndConfirm } from "./chain.js";
+import { botAccount, publicClient } from "./chain.js";
 import { ADDRESSES, config } from "./config.js";
-import { ALLOWANCE_KEYS, ALLOWANCE_PERIOD_SECONDS, ROLE_KEY, tradePermissions } from "./permissions.js";
+import { ALLOWANCE_KEYS, ALLOWANCE_PERIOD_SECONDS, FEE_ALLOWANCE_KEY, ROLE_KEY, tradePermissions } from "./permissions.js";
 import { SALT_NONCE, isDeployed, previousModule } from "./safe.js";
 
 // The Roles module's owner, avatar and target are all the user's Safe.
@@ -37,25 +36,6 @@ export function predictRolesAddress(safe) {
   return getContractAddress({ opcode: "CREATE2", from: ADDRESSES.moduleProxyFactory, salt, bytecode });
 }
 
-/** Deploys the user's Roles module. It stays switched off until the user enables the bot. */
-export async function deployRoles(safe) {
-  const roles = predictRolesAddress(safe);
-  if (!(await isDeployed(roles))) {
-    const receipt = await sendAndConfirm(relayerClient, relayerQueue, {
-      address: ADDRESSES.moduleProxyFactory,
-      abi: moduleProxyFactoryAbi,
-      functionName: "deployModule",
-      args: [ADDRESSES.rolesMastercopy, rolesInitializer(safe), SALT_NONCE],
-    });
-    const [event] = parseEventLogs({ abi: moduleProxyFactoryAbi, eventName: "ModuleProxyCreation", logs: receipt.logs });
-    if (!event || !isAddressEqual(event.args.proxy, roles)) {
-      throw new Error(`Roles module deployed at an unexpected address: ${event?.args.proxy}`);
-    }
-  }
-  await assertRolesLinkedTo(roles, safe);
-  return roles;
-}
-
 export async function assertRolesLinkedTo(roles, safe) {
   const [owner, avatar, target] = await Promise.all(
     ["owner", "avatar", "target"].map((functionName) => publicClient.readContract({ address: roles, abi: rolesAbi, functionName })),
@@ -68,11 +48,24 @@ export async function assertRolesLinkedTo(roles, safe) {
 const call = (to, functionName, args) => ({ to, data: encodeFunctionData({ abi: rolesAbi, functionName, args }) });
 
 /**
- * The calls the user's Safe makes when they click "Enable bot":
- * give the bot key its role, write the trade-only rules, set daily limits, then switch the module on.
+ * The calls the user's Safe makes when they click "Enable bot", all in one MetaMask transaction:
+ * deploy the Roles module the first time, give the bot key its role, write the trade-only rules,
+ * set the daily limits and fee cap, then switch the module on.
  */
 export async function buildEnableBotCalls(safe, roles) {
-  const calls = [call(roles, "assignRoles", [botAccount.address, [ROLE_KEY], [true]])];
+  const calls = [];
+  if (!(await isDeployed(roles))) {
+    // Anyone may call Zodiac's factory. The Roles module it creates is owned by this Safe.
+    calls.push({
+      to: ADDRESSES.moduleProxyFactory,
+      data: encodeFunctionData({
+        abi: moduleProxyFactoryAbi,
+        functionName: "deployModule",
+        args: [ADDRESSES.rolesMastercopy, rolesInitializer(safe), SALT_NONCE],
+      }),
+    });
+  }
+  calls.push(call(roles, "assignRoles", [botAccount.address, [ROLE_KEY], [true]]));
 
   const { targets } = processPermissions(tradePermissions());
   for (const target of targets) {
@@ -101,6 +94,8 @@ export async function buildEnableBotCalls(safe, roles) {
     const limit = config.rules.dailyLimits[symbol];
     calls.push(call(roles, "setAllowance", [key, limit, limit, limit, ALLOWANCE_PERIOD_SECONDS, timestamp]));
   }
+  const feeCap = config.rules.dailyFeeCap;
+  calls.push(call(roles, "setAllowance", [FEE_ALLOWANCE_KEY, feeCap, feeCap, feeCap, ALLOWANCE_PERIOD_SECONDS, timestamp]));
 
   calls.push({ to: safe, data: encodeFunctionData({ abi: safeAbi, functionName: "enableModule", args: [roles] }) });
   return calls;
@@ -122,8 +117,18 @@ function accruedBalance([refill, maxRefill, period, balance, timestamp], now) {
   return next < maxRefill ? next : maxRefill;
 }
 
+/** How much network fee the bot may still take today, or 0 if the rules aren't set up. */
+export async function feeRemainingToday(roles) {
+  if (!roles || !(await isDeployed(roles))) return 0n;
+  const [allowance, block] = await Promise.all([
+    publicClient.readContract({ address: roles, abi: rolesAbi, functionName: "allowances", args: [FEE_ALLOWANCE_KEY] }),
+    publicClient.getBlock(),
+  ]);
+  return accruedBalance(allowance, block.timestamp);
+}
+
 export async function getRolesState(safe, roles) {
-  if (!roles || !(await isDeployed(roles))) return { deployed: false, botEnabled: false, remainingToday: {} };
+  if (!roles || !(await isDeployed(roles))) return { deployed: false, botEnabled: false, remainingToday: {}, feeRemainingToday: 0n };
   const [botEnabled, block] = await Promise.all([
     publicClient.readContract({ address: safe, abi: safeAbi, functionName: "isModuleEnabled", args: [roles] }),
     publicClient.getBlock(),
@@ -133,5 +138,5 @@ export async function getRolesState(safe, roles) {
     const allowance = await publicClient.readContract({ address: roles, abi: rolesAbi, functionName: "allowances", args: [key] });
     remainingToday[symbol] = accruedBalance(allowance, block.timestamp);
   }
-  return { deployed: true, botEnabled, remainingToday };
+  return { deployed: true, botEnabled, remainingToday, feeRemainingToday: await feeRemainingToday(roles) };
 }

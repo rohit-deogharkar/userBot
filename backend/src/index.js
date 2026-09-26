@@ -1,7 +1,7 @@
 import cors from "cors";
 import express from "express";
 import { formatEther } from "viem";
-import { botAccount, publicClient, relayerAccount } from "./chain.js";
+import { botAccount, feeCollector, publicClient } from "./chain.js";
 import { config, networkProblem } from "./config.js";
 import { closeDb, connectDb } from "./db.js";
 import { describeError } from "./errors.js";
@@ -45,11 +45,11 @@ const server = app.listen(config.port, async () => {
     if (chainId !== config.chain.id) {
       console.warn(`WARNING: RPC at ${config.rpcUrl} reports chain ${chainId}, expected ${config.chain.id}.`);
     }
-    for (const [label, account] of [["Relayer", relayerAccount], ["Bot", botAccount]]) {
-      const balance = await publicClient.getBalance({ address: account.address });
-      console.log(`${label} ${account.address} has ${formatEther(balance)} ${config.nativeSymbol} for gas`);
-      if (balance === 0n) console.warn(`WARNING: ${label} has no ${config.nativeSymbol} and cannot send transactions.`);
-    }
+    const balance = await publicClient.getBalance({ address: botAccount.address });
+    const keySource = config.botKmsKeyId ? "AWS KMS" : "local key, development only";
+    console.log(`Bot ${botAccount.address} (${keySource}) has ${formatEther(balance)} ${config.nativeSymbol} for trade gas`);
+    if (balance === 0n) console.warn(`WARNING: the bot has no ${config.nativeSymbol} and cannot trade.`);
+    console.log(`Per-trade network fees go to ${feeCollector}`);
   } catch (error) {
     console.warn(`WARNING: cannot reach the blockchain node at ${config.rpcUrl}: ${error.shortMessage || error.message}`);
     if (config.networkName === "bsc-fork") {

@@ -6,8 +6,17 @@ import { publicClient } from "./chain.js";
 import { TOKENS, config, otherToken } from "./config.js";
 import { toJson, trades, users, walletActions } from "./db.js";
 import { HttpError, describeError } from "./errors.js";
-import { buildEnableBotCalls, buildStopBotCall, deployRoles, getRolesState } from "./roles.js";
-import { buildSafeTx, deploySafe, encodeMultiSend, executeSafeTx, isDeployed, safeTxTypedData } from "./safe.js";
+import { buildEnableBotCalls, buildStopBotCall, getRolesState, predictRolesAddress } from "./roles.js";
+import {
+  assertSafeOwnedOnlyBy,
+  buildCreateSafeTx,
+  buildSafeTx,
+  confirmSafeTx,
+  encodeMultiSend,
+  isDeployed,
+  predictSafeAddress,
+  safeTxTypedData,
+} from "./safe.js";
 
 const short = (address) => `${address.slice(0, 6)}…${address.slice(-4)}`;
 
@@ -37,26 +46,26 @@ export async function getWalletInfo(user) {
     botEnabled: rolesState.botEnabled,
     balances,
     remainingToday: rolesState.remainingToday,
+    feeRemainingToday: rolesState.feeRemainingToday,
   };
 }
 
-// Stops a double click from sending two wallet deployments at once.
-const creating = new Map();
+/** The MetaMask transaction that creates the user's bot wallet. The user sends it and pays the gas. */
+export async function prepareCreateWallet(owner) {
+  return buildCreateSafeTx(owner);
+}
 
-/** Creates the user's bot wallet and its (switched off) Roles module. Safe to call more than once. */
-export async function createBotWallet(owner) {
-  const key = owner.toLowerCase();
-  if (!creating.has(key)) {
-    creating.set(
-      key,
-      (async () => {
-        const safe = await deploySafe(owner);
-        const roles = await deployRoles(safe);
-        return users.upsertWallet(owner, safe, roles);
-      })().finally(() => creating.delete(key)),
-    );
+/**
+ * Records the user's bot wallet once it exists on the blockchain.
+ * The Roles module address is known in advance; the module itself is created when the user first enables the bot.
+ */
+export async function syncBotWallet(owner) {
+  const safe = await predictSafeAddress(owner);
+  if (!(await isDeployed(safe))) {
+    throw new HttpError(400, "Your bot wallet is not on the blockchain yet. Confirm the MetaMask transaction first.");
   }
-  return creating.get(key);
+  await assertSafeOwnedOnlyBy(safe, owner);
+  return users.upsertWallet(owner, safe, predictRolesAddress(safe));
 }
 
 async function requireWallet(owner) {
@@ -68,8 +77,8 @@ async function requireWallet(owner) {
 }
 
 /**
- * Builds a wallet action for the user to sign in MetaMask.
- * The backend decides the contents, the user's signature approves them, and nobody can change them afterwards.
+ * Builds a wallet action for the user to send from MetaMask. The user pays its gas.
+ * The browser checks the contents before MetaMask opens, and the Safe only accepts it from the owner.
  */
 export async function prepareWalletAction(owner, { kind, token, amount }) {
   const { user, safe, roles } = await requireWallet(owner);
@@ -114,19 +123,20 @@ export async function prepareWalletAction(owner, { kind, token, amount }) {
   return { id, kind, summary, typedData: JSON.parse(toJson(safeTxTypedData(safe, safeTx))) };
 }
 
-export async function executeWalletAction(owner, id, signature) {
-  const action = await walletActions.claimForSubmit(id, owner);
+/** Records a wallet action the user sent from MetaMask, after checking the transaction on-chain. */
+export async function confirmWalletAction(owner, id, txHash) {
+  const action = await walletActions.claimForConfirm(id, owner);
   if (!action) {
     const existing = await walletActions.find(id, owner);
     if (!existing) throw new HttpError(404, "Wallet action not found.");
     throw new HttpError(400, `This action is already ${existing.status}.`);
   }
   try {
-    const txHash = await executeSafeTx(getAddress(action.safeAddress), owner, action.safeTx, signature);
+    await confirmSafeTx(getAddress(action.safeAddress), owner, action.safeTx, txHash);
     await walletActions.finish(id, "executed", { txHash });
     return { txHash };
   } catch (error) {
-    await walletActions.finish(id, error.status === 409 ? "expired" : "failed", { error: describeError(error).message });
+    await walletActions.finish(id, "failed", { error: describeError(error).message });
     throw error;
   }
 }
@@ -140,7 +150,7 @@ export async function tradeForUser(owner, { sell, amountIn, source }) {
   const base = { owner, safeAddress: safe, tokenIn: tokenIn.symbol, tokenOut: tokenOut.symbol, amountIn, source };
   try {
     const result = await executeSwap({ safe, roles, tokenIn, tokenOut, amountIn });
-    await trades.record({ ...base, minOut: result.minOut, amountOut: result.amountOut, txHash: result.txHashes.at(-1), status: "success" });
+    await trades.record({ ...base, minOut: result.minOut, amountOut: result.amountOut, fee: result.fee, txHash: result.swapTxHash, status: "success" });
     return { ...result, tokenIn: tokenIn.symbol, tokenOut: tokenOut.symbol };
   } catch (error) {
     await trades.record({ ...base, status: "failed", error: describeError(error).message });

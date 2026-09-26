@@ -1,6 +1,6 @@
 // One-time setup for BNB testnet. Run with: npm run testnet:setup
 //
-// BNB testnet is missing three things the bot needs, and this script creates them with the relayer key:
+// BNB testnet is missing three things the bot needs, and this script creates them with the deployer key:
 //   1. Zodiac Roles 2.1.1, copied byte for byte from BNB Chain.
 //   2. A test USDT that anyone can mint.
 //   3. A DEOD/USDT pool on PancakeSwap v3 at the 1% fee tier, priced like mainnet, with test liquidity.
@@ -22,11 +22,15 @@ import {
   zeroAddress,
 } from "viem";
 import { erc20Abi } from "../src/abis.js";
-import { botAccount, publicClient, relayerAccount, relayerClient } from "../src/chain.js";
+import { botAccount, deployerAccount, deployerClient, publicClient } from "../src/chain.js";
 import { TESTNET_CONTRACTS, TESTNET_DEPLOYMENT_FILE, TOKENS, config } from "../src/config.js";
 
 if (config.networkName !== "bsc-testnet") {
   console.error('Run this with the testnet settings: "npm run testnet:setup".');
+  process.exit(1);
+}
+if (!deployerAccount) {
+  console.error("Set DEPLOYER_PRIVATE_KEY in .env.testnet. The deployer pays for this one-time setup.");
   process.exit(1);
 }
 
@@ -51,7 +55,7 @@ const FULL_RANGE = { tickLower: -887200, tickUpper: 887200 };
 const DEOD_LIQUIDITY = parseUnits("1250000", 18);
 const USDT_LIQUIDITY = parseUnits("25000", 18);
 const BOT_GAS = parseEther("0.02");
-const MIN_RELAYER_BALANCE = parseEther("0.05");
+const MIN_DEPLOYER_BALANCE = parseEther("0.05");
 
 const testUsdtArtifact = JSON.parse(fs.readFileSync(new URL("../testnet/TestUSDT.json", import.meta.url), "utf8"));
 const deodAbi = parseAbi(["function mint(uint256 amount)"]);
@@ -68,9 +72,10 @@ function save() {
   deployment.chainId = config.chain.id;
   deployment.updatedAt = new Date().toISOString();
   fs.writeFileSync(TESTNET_DEPLOYMENT_FILE, JSON.stringify(deployment, null, 2) + "\n");
-  // The browser checks what users sign against hard-coded addresses, so it needs the test USDT address too.
+  // The browser checks what users send against hard-coded addresses, so it needs the testnet addresses too.
   const frontendFile = path.resolve(path.dirname(TESTNET_DEPLOYMENT_FILE), "../../frontend/src/lib/testnetContracts.json");
-  fs.writeFileSync(frontendFile, JSON.stringify({ usdt: deployment.usdt ?? null }, null, 2) + "\n");
+  const forFrontend = { usdt: deployment.usdt ?? null, rolesMastercopy: deployment.rolesMastercopy ?? null };
+  fs.writeFileSync(frontendFile, JSON.stringify(forFrontend, null, 2) + "\n");
 }
 
 const hasCode = async (address) => {
@@ -80,7 +85,7 @@ const hasCode = async (address) => {
 };
 
 async function send(request) {
-  const hash = await relayerClient.writeContract(request);
+  const hash = await deployerClient.writeContract(request);
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`Transaction ${hash} reverted`);
   return receipt;
@@ -90,7 +95,7 @@ async function send(request) {
 async function deployRuntimeCopy(runtimeHex) {
   const length = (runtimeHex.length - 2) / 2;
   const prefix = `0x61${length.toString(16).padStart(4, "0")}80600c6000396000f3`;
-  const hash = await relayerClient.sendTransaction({ data: prefix + runtimeHex.slice(2) });
+  const hash = await deployerClient.sendTransaction({ data: prefix + runtimeHex.slice(2) });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success" || !receipt.contractAddress) throw new Error(`Deployment ${hash} failed`);
   return receipt.contractAddress;
@@ -112,10 +117,10 @@ function sqrt(value) {
 const chainId = await publicClient.getChainId();
 if (chainId !== 97) throw new Error(`Expected BNB testnet (chain 97) at ${config.rpcUrl}, got chain ${chainId}.`);
 
-const relayerBalance = await publicClient.getBalance({ address: relayerAccount.address });
-console.log(`Relayer ${relayerAccount.address} has ${formatEther(relayerBalance)} test BNB.`);
-if (relayerBalance < MIN_RELAYER_BALANCE) {
-  console.error(`\nSend at least ${formatEther(MIN_RELAYER_BALANCE)} test BNB to the relayer address above, then run this again.`);
+const deployerBalance = await publicClient.getBalance({ address: deployerAccount.address });
+console.log(`Deployer ${deployerAccount.address} has ${formatEther(deployerBalance)} test BNB.`);
+if (deployerBalance < MIN_DEPLOYER_BALANCE) {
+  console.error(`\nSend at least ${formatEther(MIN_DEPLOYER_BALANCE)} test BNB to the deployer address above, then run this again.`);
   process.exit(1);
 }
 
@@ -144,7 +149,7 @@ if (await hasCode(deployment.rolesMastercopy)) {
 if (await hasCode(deployment.usdt)) {
   console.log(`2. Test USDT already at ${deployment.usdt}`);
 } else {
-  const hash = await relayerClient.deployContract({ abi: testUsdtArtifact.abi, bytecode: testUsdtArtifact.bytecode });
+  const hash = await deployerClient.deployContract({ abi: testUsdtArtifact.abi, bytecode: testUsdtArtifact.bytecode });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`Test USDT deployment ${hash} failed`);
   deployment.usdt = receipt.contractAddress;
@@ -184,7 +189,7 @@ if (liquidity > 0n) {
   console.log("3b. Pool already has liquidity");
 } else {
   await send({ address: DEOD, abi: deodAbi, functionName: "mint", args: [DEOD_LIQUIDITY] });
-  await send({ address: USDT, abi: testUsdtArtifact.abi, functionName: "mint", args: [relayerAccount.address, USDT_LIQUIDITY] });
+  await send({ address: USDT, abi: testUsdtArtifact.abi, functionName: "mint", args: [deployerAccount.address, USDT_LIQUIDITY] });
   for (const token of [DEOD, USDT]) {
     await send({ address: token, abi: erc20Abi, functionName: "approve", args: [TESTNET_CONTRACTS.positionManager, maxUint256] });
   }
@@ -204,7 +209,7 @@ if (liquidity > 0n) {
         amount1Desired: amounts[1],
         amount0Min: 0n,
         amount1Min: 0n,
-        recipient: relayerAccount.address,
+        recipient: deployerAccount.address,
         deadline: timestamp + 600n,
       },
     ],
@@ -217,11 +222,11 @@ const botBalance = await publicClient.getBalance({ address: botAccount.address }
 if (botBalance >= BOT_GAS / 2n) {
   console.log(`4. Bot ${botAccount.address} already has ${formatEther(botBalance)} test BNB`);
 } else {
-  const hash = await relayerClient.sendTransaction({ to: botAccount.address, value: BOT_GAS });
+  const hash = await deployerClient.sendTransaction({ to: botAccount.address, value: BOT_GAS });
   await publicClient.waitForTransactionReceipt({ hash });
   console.log(`4. Sent ${formatEther(BOT_GAS)} test BNB to the bot ${botAccount.address}`);
 }
 
 save();
 console.log(`\nBNB testnet is ready. Addresses saved to ${path.relative(process.cwd(), TESTNET_DEPLOYMENT_FILE)}.`);
-console.log(`Relayer has ${formatEther(await publicClient.getBalance({ address: relayerAccount.address }))} test BNB left.`);
+console.log(`Deployer has ${formatEther(await publicClient.getBalance({ address: deployerAccount.address }))} test BNB left.`);

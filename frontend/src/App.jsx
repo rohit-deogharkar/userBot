@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { erc20Abi, parseUnits } from "viem";
+import { erc20Abi, parseUnits, zeroAddress } from "viem";
 import { createSiweMessage } from "viem/siwe";
 import Activity from "./components/Activity.jsx";
 import BotControl from "./components/BotControl.jsx";
@@ -11,8 +11,17 @@ import WalletCard from "./components/WalletCard.jsx";
 import WithdrawForm from "./components/WithdrawForm.jsx";
 import { api, loadSession, saveSession, setToken } from "./lib/api.js";
 import { shortAddress } from "./lib/format.js";
-import { verifySafeTx } from "./lib/verifySafeTx.js";
-import { chainFromConfig, createClients, ensureChain, friendlyError, hasMetaMask, reviveSafeTypedData } from "./lib/wallet.js";
+import { verifyCreateWalletTx, verifySafeTx } from "./lib/verifySafeTx.js";
+import {
+  chainFromConfig,
+  createClients,
+  ensureChain,
+  friendlyError,
+  hasMetaMask,
+  ownerSentSignature,
+  reviveSafeTypedData,
+  safeExecAbi,
+} from "./lib/wallet.js";
 
 export default function App() {
   const [config, setConfig] = useState(null);
@@ -109,8 +118,15 @@ export default function App() {
       setSession(next);
     });
 
+  /** The user creates their bot wallet from MetaMask and pays the network fee. */
   const createWallet = () =>
-    run("Creating your bot wallet…", async () => {
+    run("Confirm the wallet creation in MetaMask…", async () => {
+      await ensureChain(clients.wallet, chain);
+      const { tx } = await api.post("/wallet/create-tx");
+      verifyCreateWalletTx({ tx, owner: account, chainId: chain.id });
+      const hash = await clients.wallet.sendTransaction({ account, to: tx.to, data: tx.data });
+      setBusy("Waiting for your bot wallet to be created…");
+      await clients.reader.waitForTransactionReceipt({ hash });
       await api.post("/wallet");
       await refresh();
       return "Your bot wallet is ready. Deposit funds, then enable the bot.";
@@ -133,16 +149,27 @@ export default function App() {
       return `Deposited ${amount} ${symbol} into your bot wallet.`;
     });
 
-  /** Enable, stop and withdraw all follow the same path: the backend builds it, the user signs it. */
+  /**
+   * Enable, stop and withdraw all follow the same path: the backend builds the wallet action,
+   * the browser checks it, and the user sends it from MetaMask and pays the network fee.
+   */
   const walletAction = (body, label, done) =>
     run(label, async () => {
       await ensureChain(clients.wallet, chain);
       const action = await api.post("/wallet/actions", body);
       const typedData = reviveSafeTypedData(action.typedData);
       verifySafeTx({ kind: body.kind, request: body, typedData, owner: account, wallet: me.wallet, config });
-      const signature = await clients.wallet.signTypedData({ account, ...typedData });
-      setBusy("Submitting…");
-      await api.post(`/wallet/actions/${action.id}/execute`, { signature });
+      const m = typedData.message;
+      const hash = await clients.wallet.writeContract({
+        account,
+        address: me.wallet.safeAddress,
+        abi: safeExecAbi,
+        functionName: "execTransaction",
+        args: [m.to, m.value, m.data, m.operation, 0n, 0n, 0n, zeroAddress, zeroAddress, ownerSentSignature(account)],
+      });
+      setBusy("Waiting for the transaction to confirm…");
+      await clients.reader.waitForTransactionReceipt({ hash });
+      await api.post(`/wallet/actions/${action.id}/confirm`, { txHash: hash });
       await refresh();
       return done;
     });
@@ -199,7 +226,7 @@ export default function App() {
                 busy={busy}
                 balances={wallet.balances}
                 onWithdraw={(token, amount) =>
-                  walletAction({ kind: "withdraw", token, amount }, "Sign the withdrawal in MetaMask…", "Withdrawal sent to your MetaMask.")
+                  walletAction({ kind: "withdraw", token, amount }, "Confirm the withdrawal in MetaMask…", "Withdrawal sent to your MetaMask.")
                 }
               />
             </div>
@@ -208,8 +235,8 @@ export default function App() {
                 config={config}
                 wallet={wallet}
                 busy={busy}
-                onEnable={() => walletAction({ kind: "enable-bot" }, "Sign to enable the bot in MetaMask…", "The bot is enabled.")}
-                onStop={() => walletAction({ kind: "stop-bot" }, "Sign to stop the bot in MetaMask…", "The bot is stopped.")}
+                onEnable={() => walletAction({ kind: "enable-bot" }, "Confirm enabling the bot in MetaMask…", "The bot is enabled.")}
+                onStop={() => walletAction({ kind: "stop-bot" }, "Confirm stopping the bot in MetaMask…", "The bot is stopped.")}
               />
               {config.testTradesEnabled && <TestTrade config={config} busy={busy} botEnabled={wallet.botEnabled} onTrade={testTrade} />}
               <Activity config={config} actions={me.actions} trades={me.trades} />

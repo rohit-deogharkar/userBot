@@ -40,7 +40,7 @@ export default function BotControl({ config, wallet, busy, onEnable, onStop }) {
           <button className="primary" disabled={Boolean(busy)} onClick={onEnable}>
             Enable bot
           </button>
-          <p className="muted small-text">MetaMask will ask for one signature. Signing is free, and we pay the network fee.</p>
+          <p className="muted small-text">MetaMask asks you to confirm one transaction, and you pay its small network fee in {config.nativeSymbol}. After that the bot keeps trading, even when you are logged out, until you stop it.</p>
         </>
       )}
     </section>

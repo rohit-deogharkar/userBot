@@ -1,5 +1,6 @@
 import {
   concat,
+  decodeFunctionData,
   encodeAbiParameters,
   encodeFunctionData,
   encodePacked,
@@ -7,13 +8,13 @@ import {
   getContractAddress,
   isAddressEqual,
   keccak256,
-  recoverTypedDataAddress,
+  pad,
   size,
   toHex,
   zeroAddress,
 } from "viem";
 import { multiSendAbi, safeAbi, safeProxyFactoryAbi } from "./abis.js";
-import { publicClient, relayerClient, relayerQueue, sendAndConfirm } from "./chain.js";
+import { publicClient } from "./chain.js";
 import { ADDRESSES, config } from "./config.js";
 import { HttpError } from "./errors.js";
 
@@ -58,19 +59,20 @@ export async function isDeployed(address) {
   return Boolean(code && code !== "0x");
 }
 
-/** Creates the bot wallet with the user's MetaMask as its only owner. The relayer pays gas. */
-export async function deploySafe(owner) {
-  const safe = await predictSafeAddress(owner);
-  if (!(await isDeployed(safe))) {
-    await sendAndConfirm(relayerClient, relayerQueue, {
-      address: ADDRESSES.safeProxyFactory,
-      abi: safeProxyFactoryAbi,
-      functionName: "createProxyWithNonce",
-      args: [ADDRESSES.safeSingletonL2, safeInitializer(owner), SALT_NONCE],
-    });
-  }
-  await assertSafeOwnedOnlyBy(safe, owner);
-  return safe;
+/** The transaction the user sends from MetaMask to create their bot wallet. The user pays the gas. */
+export async function buildCreateSafeTx(owner) {
+  return {
+    safeAddress: await predictSafeAddress(owner),
+    tx: {
+      to: ADDRESSES.safeProxyFactory,
+      value: 0n,
+      data: encodeFunctionData({
+        abi: safeProxyFactoryAbi,
+        functionName: "createProxyWithNonce",
+        args: [ADDRESSES.safeSingletonL2, safeInitializer(owner), SALT_NONCE],
+      }),
+    },
+  };
 }
 
 export async function getSafeState(safe) {
@@ -150,22 +152,36 @@ export function safeTxTypedData(safe, tx) {
   };
 }
 
-/** Checks the owner's signature and submits the transaction. The relayer pays gas but cannot change anything. */
-export async function executeSafeTx(safe, owner, tx, signature) {
-  const signer = await recoverTypedDataAddress({ ...safeTxTypedData(safe, tx), signature });
-  if (!isAddressEqual(signer, owner)) {
-    throw new HttpError(400, "Signature does not come from the bot wallet's owner.");
+/**
+ * The signature Safe accepts when the owner sends execTransaction themselves.
+ * Safe checks that the sender is the owner, so no separate signing step is needed.
+ */
+export const ownerSentSignature = (owner) => concat([pad(getAddress(owner)), pad("0x00"), "0x01"]);
+
+/**
+ * Checks on-chain that the owner really sent this wallet action from MetaMask and that it succeeded.
+ * Used only to keep the activity history accurate. The blockchain itself already enforced everything.
+ */
+export async function confirmSafeTx(safe, owner, tx, txHash) {
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
+  const transaction = await publicClient.getTransaction({ hash: txHash });
+  if (receipt.status !== "success") throw new HttpError(400, "That transaction failed on the blockchain.");
+  if (!isAddressEqual(transaction.from, owner)) throw new HttpError(400, "That transaction was not sent by the wallet owner.");
+  if (!transaction.to || !isAddressEqual(transaction.to, safe)) throw new HttpError(400, "That transaction was not sent to your bot wallet.");
+  let decoded;
+  try {
+    decoded = decodeFunctionData({ abi: safeAbi, data: transaction.input });
+  } catch {
+    throw new HttpError(400, "That transaction is not a wallet action.");
   }
-  const currentNonce = await publicClient.readContract({ address: safe, abi: safeAbi, functionName: "nonce" });
-  if (currentNonce !== tx.nonce) {
-    throw new HttpError(409, "This request is out of date because another wallet action happened first. Please try again.");
-  }
-  const receipt = await sendAndConfirm(relayerClient, relayerQueue, {
-    address: safe,
-    abi: safeAbi,
-    functionName: "execTransaction",
-    args: [tx.to, tx.value, tx.data, tx.operation, 0n, 0n, 0n, zeroAddress, zeroAddress, signature],
-  });
+  const [to, value, data, operation] = decoded.args;
+  const matches =
+    decoded.functionName === "execTransaction" &&
+    isAddressEqual(to, tx.to) &&
+    value === tx.value &&
+    data.toLowerCase() === tx.data.toLowerCase() &&
+    Number(operation) === tx.operation;
+  if (!matches) throw new HttpError(400, "That transaction does not match this wallet action.");
   return receipt.transactionHash;
 }
 

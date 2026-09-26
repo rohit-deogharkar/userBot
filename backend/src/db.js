@@ -18,6 +18,8 @@ export async function connectDb() {
     collection("loginNonces").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     collection("users").createIndex({ address: 1, chainId: 1 }, { unique: true }),
     collection("walletActions").createIndex({ owner: 1, createdAt: -1 }),
+    // One blockchain transaction can confirm only one wallet action.
+    collection("walletActions").createIndex({ txHash: 1 }, { unique: true, partialFilterExpression: { txHash: { $type: "string" } } }),
     collection("trades").createIndex({ owner: 1, createdAt: -1 }),
   ]);
   return database;
@@ -85,14 +87,14 @@ export const walletActions = {
     });
   },
   /**
-   * Atomically moves an action from "awaiting_signature" to "submitting" and returns it.
+   * Atomically moves an action from "awaiting_signature" to "confirming" and returns it.
    * Returns null if it doesn't exist, belongs to someone else, or was already claimed,
-   * so the same signed action can never be submitted twice.
+   * so the same action can never be confirmed twice.
    */
-  async claimForSubmit(id, owner) {
+  async claimForConfirm(id, owner) {
     const doc = await collection("walletActions").findOneAndUpdate(
       { _id: id, owner: owner.toLowerCase(), status: "awaiting_signature" },
-      { $set: { status: "submitting" } },
+      { $set: { status: "confirming" } },
       { returnDocument: "after" },
     );
     if (!doc) return null;
@@ -125,6 +127,7 @@ export const trades = {
       amountIn: String(trade.amountIn),
       minOut: trade.minOut == null ? null : String(trade.minOut),
       amountOut: trade.amountOut == null ? null : String(trade.amountOut),
+      fee: trade.fee == null ? null : String(trade.fee),
       txHash: trade.txHash ?? null,
       status: trade.status,
       error: trade.error ?? null,

@@ -46,6 +46,13 @@ export default function WalletCard({ config, owner, wallet }) {
         ))}
       </dl>
 
+      {wallet.botEnabled && config.fees && (
+        <p className="muted small-text">
+          Bot network fees: {formatToken(config, config.fees.perTrade, "USDT")} USDT per trade, paid from this wallet.{" "}
+          <span className="num">{formatToken(config, wallet.feeRemainingToday, "USDT")}</span> USDT of today's{" "}
+          {formatToken(config, config.fees.dailyCap, "USDT")} USDT cap left.
+        </p>
+      )}
       {wallet.botEnabled && (
         <p className="muted small-text">
           Left to sell today:{" "}

@@ -1,7 +1,7 @@
 const STEPS = [
   { key: "connect", title: "Connect MetaMask", text: "Your existing account works as it is." },
   { key: "signin", title: "Sign in", text: "One free signature proves the account is yours." },
-  { key: "create", title: "Create your bot wallet", text: "We create it and pay the fee. Your MetaMask is its only owner." },
+  { key: "create", title: "Create your bot wallet", text: "One MetaMask transaction, and you pay the small network fee. Your MetaMask is its only owner." },
 ];
 
 export default function Onboarding({ hasMetaMask, ready, account, signedIn, loadingWallet, busy, onConnect, onSignIn, onCreateWallet }) {

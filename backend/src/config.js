@@ -114,8 +114,14 @@ export const config = {
   port: Number(process.env.PORT || 4000),
   appOrigin: process.env.APP_ORIGIN || "http://localhost:5173",
   jwtSecret: required("JWT_SECRET"),
-  relayerPrivateKey: required("RELAYER_PRIVATE_KEY"),
-  botPrivateKey: required("BOT_PRIVATE_KEY"),
+  // The bot's trade-only key. In production, set BOT_KMS_KEY_ID so the key lives in AWS KMS and nobody can see it.
+  // BOT_PRIVATE_KEY is for local development and testnet only.
+  botKmsKeyId: process.env.BOT_KMS_KEY_ID || null,
+  botPrivateKey: process.env.BOT_PRIVATE_KEY || null,
+  // Only used by the testnet setup and test-funding scripts. The running app never needs it.
+  deployerPrivateKey: process.env.DEPLOYER_PRIVATE_KEY || null,
+  // Where the per-trade network fee goes. Defaults to the bot's own address, which pays the trade gas.
+  feeCollector: process.env.FEE_COLLECTOR || null,
   mongoUri: process.env.MONGODB_URI || "mongodb://127.0.0.1:27017",
   // One database per network, so test data never mixes with real data.
   mongoDbName: process.env.MONGODB_DB || `userdexbot_${networkName.replace(/-/g, "_")}`,
@@ -128,12 +134,20 @@ export const config = {
       DEOD: parseUnits(process.env.DAILY_LIMIT_DEOD || "10000", 18),
       USDT: parseUnits(process.env.DAILY_LIMIT_USDT || "200", 18),
     },
+    // The user pays the bot's gas: a flat fee in USDT per trade, taken from their bot wallet.
+    // The on-chain rules cap the total per day, so the bot can never take more.
+    tradeFee: parseUnits(process.env.TRADE_FEE_USDT || "0.02", 18),
+    dailyFeeCap: parseUnits(process.env.DAILY_FEE_CAP_USDT || "1", 18),
   },
   strategy: {
     enabled: process.env.STRATEGY_ENABLED === "true",
     intervalMs: Number(process.env.STRATEGY_INTERVAL_MS || 60_000),
   },
 };
+
+if (!config.botKmsKeyId && !config.botPrivateKey) {
+  throw new Error("Set BOT_KMS_KEY_ID (production) or BOT_PRIVATE_KEY (development). See .env.example.");
+}
 
 // SIWE messages must name the site the user signed in on.
 config.appDomain = new URL(config.appOrigin).host;

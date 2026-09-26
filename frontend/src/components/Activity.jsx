@@ -2,7 +2,7 @@ import { explorerLink, formatToken, timeAgo } from "../lib/format.js";
 
 const STATUS_LABEL = {
   awaiting_signature: "Not signed",
-  submitting: "Submitting",
+  confirming: "Confirming",
   executed: "Done",
   success: "Done",
   failed: "Failed",

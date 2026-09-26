@@ -12,9 +12,11 @@
     "dev:testnet": "node --env-file=.env.testnet --watch src/index.js",
     "testnet:setup": "node --env-file=.env.testnet scripts/testnet-setup.js",
     "fund:testnet": "node --env-file=.env.testnet scripts/fund.js",
-    "e2e:testnet": "node --env-file=.env.testnet scripts/e2e.js"
+    "e2e:testnet": "node --env-file=.env.testnet scripts/e2e.js",
+    "test:kms": "node scripts/test-kms.js"
   },
   "dependencies": {
+    "@aws-sdk/client-kms": "^3.1141.0",
     "cors": "^2.8.6",
     "dotenv": "^18.0.4",
     "express": "^5.2.1",

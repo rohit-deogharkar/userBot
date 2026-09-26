@@ -13,7 +13,7 @@ import {
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { erc20Abi, swapRouterAbi, wethAbi } from "../src/abis.js";
-import { publicClient, relayerAccount, relayerClient } from "../src/chain.js";
+import { deployerAccount, deployerClient, publicClient } from "../src/chain.js";
 import { ADDRESSES, TOKENS, config } from "../src/config.js";
 
 if (config.networkName === "bsc") {
@@ -90,17 +90,18 @@ const deodMintAbi = parseAbi(["function mint(uint256 amount)"]);
 const usdtMintAbi = parseAbi(["function mint(address to, uint256 amount)"]);
 
 async function fundOnTestnet(address, { bnb = "10", usdt = "1000", deod = "50000" }) {
+  if (!deployerAccount) throw new Error("Set DEPLOYER_PRIVATE_KEY in .env.testnet. It pays the gas to mint test tokens.");
   if (await isLocalNode()) {
     await testClient.setBalance({ address, value: parseEther(bnb) });
-    // On a local copy of testnet the relayer may start empty. Real testnet BNB comes from you.
-    if ((await publicClient.getBalance({ address: relayerAccount.address })) < parseEther("1")) {
-      await testClient.setBalance({ address: relayerAccount.address, value: parseEther("10") });
+    // On a local copy of testnet the deployer may start empty. Real testnet BNB comes from you.
+    if ((await publicClient.getBalance({ address: deployerAccount.address })) < parseEther("1")) {
+      await testClient.setBalance({ address: deployerAccount.address, value: parseEther("10") });
     }
   }
-  // Test DEOD mints to whoever calls it, so the relayer mints and passes it on.
-  await send(relayerClient, { address: TOKENS.DEOD.address, abi: deodMintAbi, functionName: "mint", args: [parseUnits(deod, 18)] });
-  await send(relayerClient, { address: TOKENS.DEOD.address, abi: erc20Abi, functionName: "transfer", args: [address, parseUnits(deod, 18)] });
-  await send(relayerClient, { address: TOKENS.USDT.address, abi: usdtMintAbi, functionName: "mint", args: [address, parseUnits(usdt, 18)] });
+  // Test DEOD mints to whoever calls it, so the deployer mints and passes it on.
+  await send(deployerClient, { address: TOKENS.DEOD.address, abi: deodMintAbi, functionName: "mint", args: [parseUnits(deod, 18)] });
+  await send(deployerClient, { address: TOKENS.DEOD.address, abi: erc20Abi, functionName: "transfer", args: [address, parseUnits(deod, 18)] });
+  await send(deployerClient, { address: TOKENS.USDT.address, abi: usdtMintAbi, functionName: "mint", args: [address, parseUnits(usdt, 18)] });
   return balancesOf(address);
 }
 

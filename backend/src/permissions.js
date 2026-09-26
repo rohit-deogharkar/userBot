@@ -1,5 +1,6 @@
 import { formatUnits } from "viem";
 import { c, encodeKey } from "zodiac-roles-sdk";
+import { feeCollector } from "./chain.js";
 import { ADDRESSES, TOKENS, config } from "./config.js";
 
 // These rules are the whole security model. They are stored on-chain in each user's
@@ -11,6 +12,9 @@ export const ROLE_KEY = encodeKey("dexbot-trader");
 export const ALLOWANCE_KEYS = Object.fromEntries(
   Object.keys(TOKENS).map((symbol) => [symbol, encodeKey(`${symbol.toLowerCase()}-daily`)]),
 );
+
+// Meters the per-trade network fee the bot takes in USDT, so it can never take more than the daily cap.
+export const FEE_ALLOWANCE_KEY = encodeKey("usdt-fee-daily");
 
 export const ALLOWANCE_PERIOD_SECONDS = 86_400n;
 
@@ -29,6 +33,13 @@ export function tradePermissions() {
       signature: "approve(address,uint256)",
       condition: c.calldataMatches([router], ["address", "uint256"]),
     })),
+
+    // The user pays the bot's gas: the bot may send USDT only to the fee collector, within a daily cap.
+    {
+      targetAddress: USDT.address,
+      signature: "transfer(address,uint256)",
+      condition: c.calldataMatches([feeCollector, c.withinAllowance(FEE_ALLOWANCE_KEY)], ["address", "uint256"]),
+    },
 
     // The bot may swap DEOD for USDT or USDT for DEOD in one pool only.
     // The output must go back to the bot wallet itself, and the amount sold counts against a daily limit.
@@ -60,9 +71,10 @@ export function rulesSummary() {
       "Every swap sends its output back to your bot wallet.",
       "Approve DEOD and USDT for the PancakeSwap router only.",
       `Sell at most ${amount(dailyLimits.DEOD, DEOD.decimals)} DEOD and ${amount(dailyLimits.USDT, USDT.decimals)} USDT per day.`,
+      `Take ${amount(config.rules.tradeFee, USDT.decimals)} USDT per trade to pay its network fees, never more than ${amount(config.rules.dailyFeeCap, USDT.decimals)} USDT per day.`,
     ],
     blocked: [
-      "Withdraw or transfer funds to any address.",
+      "Withdraw or transfer funds anywhere, apart from the capped network fee.",
       "Trade any other token, or use any other exchange or pool.",
       "Change these rules, add modules or change the wallet owner.",
     ],

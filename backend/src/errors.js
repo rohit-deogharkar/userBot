@@ -10,7 +10,7 @@ export class HttpError extends Error {
 // Safe reports failures as short codes. These are the ones users can run into.
 const SAFE_ERRORS = {
   GS013: "The wallet transaction failed.",
-  GS025: "The wallet transaction has an invalid nonce.",
+  GS025: "Only the wallet owner can send this.",
   GS026: "The signature is not from the wallet owner.",
   GS104: "The bot is not enabled on this wallet.",
 };

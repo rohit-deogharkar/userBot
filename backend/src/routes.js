@@ -1,12 +1,20 @@
 import { Router } from "express";
 import { parseUnits } from "viem";
 import { issueNonce, requireAuth, verifyLogin } from "./auth.js";
-import { botAccount } from "./chain.js";
+import { botAccount, feeCollector } from "./chain.js";
 import { ADDRESSES, TOKENS, config } from "./config.js";
 import { toJson, trades, users, walletActions } from "./db.js";
 import { HttpError } from "./errors.js";
 import { rulesSummary } from "./permissions.js";
-import { createBotWallet, executeWalletAction, getBalances, getWalletInfo, prepareWalletAction, tradeForUser } from "./wallets.js";
+import {
+  confirmWalletAction,
+  getBalances,
+  getWalletInfo,
+  prepareCreateWallet,
+  prepareWalletAction,
+  syncBotWallet,
+  tradeForUser,
+} from "./wallets.js";
 
 export const router = Router();
 
@@ -31,6 +39,7 @@ router.get("/config", (_req, res) =>
     botAddress: botAccount.address,
     rules: rulesSummary(),
     dailyLimits: config.rules.dailyLimits,
+    fees: { perTrade: config.rules.tradeFee, dailyCap: config.rules.dailyFeeCap, collector: feeCollector, token: "USDT" },
     testTradesEnabled: config.enableTestTrades,
   }),
 );
@@ -54,8 +63,14 @@ router.get("/me", requireAuth, async (req, res) => {
   send(res, { address: owner, ownerBalances, wallet: await getWalletInfo(user), actions, trades: recentTrades });
 });
 
+// Step 1 of creating a bot wallet: the transaction the user sends from MetaMask.
+router.post("/wallet/create-tx", requireAuth, async (req, res) => {
+  send(res, await prepareCreateWallet(req.user.address));
+});
+
+// Step 2: once that transaction is mined, record the wallet. Safe to call more than once.
 router.post("/wallet", requireAuth, async (req, res) => {
-  const user = await createBotWallet(req.user.address);
+  const user = await syncBotWallet(req.user.address);
   send(res, { wallet: await getWalletInfo(user) });
 });
 
@@ -63,10 +78,11 @@ router.post("/wallet/actions", requireAuth, async (req, res) => {
   send(res, await prepareWalletAction(req.user.address, req.body ?? {}));
 });
 
-router.post("/wallet/actions/:id/execute", requireAuth, async (req, res) => {
-  const { signature } = req.body ?? {};
-  if (!signature) throw new HttpError(400, "Missing signature.");
-  send(res, await executeWalletAction(req.user.address, req.params.id, signature));
+// After the user sends the wallet action from MetaMask, the backend checks it on-chain and records it.
+router.post("/wallet/actions/:id/confirm", requireAuth, async (req, res) => {
+  const { txHash } = req.body ?? {};
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash ?? "")) throw new HttpError(400, "Missing transaction hash.");
+  send(res, await confirmWalletAction(req.user.address, req.params.id, txHash));
 });
 
 // Lets you trigger one swap by hand while the real strategy is being built.
