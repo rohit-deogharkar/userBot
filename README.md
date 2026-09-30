@@ -93,7 +93,7 @@ backend/    Node.js + Express API and the bot
   src/auth.js          Username and password logins, and linking MetaMask
   src/kms.js           Bot key signer backed by AWS KMS
   src/db.js            MongoDB: members (logins), users (smart accounts), walletActions, trades, loginNonces
-  src/strategy/        Where the trading strategy plugs in (currently empty)
+  src/strategy/        Automatic trading: the runner, and a random test strategy
   scripts/e2e.js       End-to-end proof, including theft attempts
   scripts/fund.js      Gives a test address USDT and DEOD (and BNB on local nodes)
   scripts/testnet-setup.js  One-time setup of BNB testnet
@@ -158,7 +158,7 @@ Settings are in `backend/.env` for the local copy and `backend/.env.testnet` for
 | `PER_TRADE_LIMIT_DEOD`, `PER_TRADE_LIMIT_USDT`, `DAILY_LIMIT_DEOD`, `DAILY_LIMIT_USDT` | Trade size limits, checked by the bot |
 | `POOL_FEE`, `SLIPPAGE_BPS` | Pool fee tier and maximum slippage |
 | `ENABLE_TEST_TRADES` | Shows a manual "test trade" button. Turn off in production. |
-| `STRATEGY_ENABLED`, `STRATEGY_INTERVAL_MS` | Automatic strategy loop |
+| `STRATEGY_ENABLED`, `STRATEGY_INTERVAL_MS` | Automatic trading, and how often it trades. On in `.env.testnet` (every 2 minutes), off in `.env`. Turn it off to run the proof. |
 
 ## API
 
@@ -176,9 +176,15 @@ Settings are in `backend/.env` for the local copy and `backend/.env.testnet` for
 | `POST /api/wallet/actions/:id/confirm` | Checks the user's transaction on-chain and records it |
 | `POST /api/bot/test-trade` | Makes one swap now. Development only. |
 
-## Adding the trading strategy
+## Automatic trading
 
-Write it in [backend/src/strategy/strategy.js](backend/src/strategy/strategy.js). The `decide` function gets each active user's balances and remaining daily limits, and returns either nothing or one swap to make. Set `STRATEGY_ENABLED=true` to run it on a timer for every user whose bot is on, whether they're logged in or not.
+With `STRATEGY_ENABLED=true`, the server checks every `STRATEGY_INTERVAL_MS` for users whose bot is on, whether they're logged in or not, and asks the strategy what to trade. "Stop bot" ends it for that user: the runner skips stopped bots, and the blockchain would refuse their trades anyway.
+
+A user is skipped, without a failed trade being recorded, while their smart account lacks the BNB for a trade's gas or today's gas budget is used up. Trades then resume by themselves.
+
+**The current strategy is a random test strategy.** Each time, it buys or sells DEOD at random, 50/50: it sells 1 to 10 USDT or 50 to 500 DEOD, within the balance and the limits. It's only for trying the system out. Every trade pays the pool's 1% fee, so random trading slowly loses value. It never runs on BNB Chain mainnet (`testOnly` in the strategy file).
+
+To add the real strategy, replace `decide` in [backend/src/strategy/strategy.js](backend/src/strategy/strategy.js). It gets each active user's balances, remaining daily limits and per-trade limits, and returns nothing or one swap to make. Set `testOnly` to false once it may run on mainnet.
 
 ## Before going to production
 

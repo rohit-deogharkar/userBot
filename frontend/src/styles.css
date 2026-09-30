@@ -591,6 +591,13 @@ select {
   color: var(--warn);
 }
 
+.auto-note {
+  background: var(--good-soft);
+  color: var(--good);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
 .dot {
   width: 8px;
   height: 8px;

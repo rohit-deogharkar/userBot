@@ -9,11 +9,18 @@ const STATUS_LABEL = {
   expired: "Expired",
 };
 
+/** Trades read as buying or selling DEOD. Selling USDT buys DEOD. */
 function describeTrade(config, trade) {
-  const sold = `${formatToken(config, trade.amountIn, trade.tokenIn)} ${trade.tokenIn}`;
-  if (trade.status !== "success") return `Bot tried to sell ${sold}`;
+  const amount = (raw, symbol) => `${formatToken(config, raw, symbol)} ${symbol}`;
+  const who = trade.source === "test" ? "Test trade" : "Bot";
+  const buying = trade.tokenOut === "DEOD";
+  if (trade.status !== "success") {
+    return buying ? `${who} tried to buy DEOD with ${amount(trade.amountIn, trade.tokenIn)}` : `${who} tried to sell ${amount(trade.amountIn, trade.tokenIn)}`;
+  }
   const gas = trade.gasFee ? `, gas ${formatAmount(trade.gasFee, 18, 6)} ${config.nativeSymbol}` : "";
-  return `Bot sold ${sold} for ${formatToken(config, trade.amountOut, trade.tokenOut)} ${trade.tokenOut}${gas}`;
+  return buying
+    ? `${who} bought ${amount(trade.amountOut, trade.tokenOut)} for ${amount(trade.amountIn, trade.tokenIn)}${gas}`
+    : `${who} sold ${amount(trade.amountIn, trade.tokenIn)} for ${amount(trade.amountOut, trade.tokenOut)}${gas}`;
 }
 
 export default function Activity({ config, actions, trades }) {

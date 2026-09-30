@@ -143,6 +143,7 @@ await step(`Backend is running on ${config.chain.name}`, async () => {
   const cfg = await api("GET", "/config");
   assert.equal(cfg.network, config.networkName);
   assert.equal(cfg.botAddress, bot.address);
+  assert.ok(!cfg.automaticTrading?.enabled, "set STRATEGY_ENABLED=false for the proof: automatic trades would change the balances it checks");
   assert.deepEqual(Object.keys(cfg.tokens), ["DEOD", "USDT"]);
 });
 

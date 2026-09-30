@@ -6,6 +6,7 @@ import { ADDRESSES, TOKENS, config } from "./config.js";
 import { toJson, trades, users, walletActions } from "./db.js";
 import { HttpError } from "./errors.js";
 import { MM } from "./metamask.js";
+import { automaticTrading } from "./strategy/runner.js";
 import {
   confirmEnableBot,
   confirmWalletAction,
@@ -60,6 +61,7 @@ router.get("/config", (_req, res) => {
       ],
     },
     testTradesEnabled: config.enableTestTrades,
+    automaticTrading,
     tokensUsed: [DEOD.symbol, USDT.symbol],
   });
 });

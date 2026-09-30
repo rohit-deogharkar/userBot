@@ -1,5 +1,7 @@
 import { formatToken } from "../lib/format.js";
 
+const intervalText = (ms) => (ms % 60_000 === 0 ? `${ms / 60_000 === 1 ? "minute" : `${ms / 60_000} minutes`}` : `${Math.round(ms / 1000)} seconds`);
+
 export default function BotControl({ config, wallet, busy, onEnable, onStop, permission }) {
   const { rules } = config;
 
@@ -38,6 +40,15 @@ export default function BotControl({ config, wallet, busy, onEnable, onStop, per
           The permission you were shown lets the bot take at most {formatToken(config, permission.dailyGasCap, config.nativeSymbol)}{" "}
           {config.nativeSymbol} per day for gas, paid back only to the bot's address.
         </p>
+      )}
+      {wallet.botEnabled && config.automaticTrading?.enabled && (
+        <p className="auto-note small-text">
+          Trading automatically: {config.automaticTrading.description} every {intervalText(config.automaticTrading.intervalMs)}.
+          It keeps going while you're logged out, and pauses when the {config.nativeSymbol} for gas or today's gas limit runs out.
+        </p>
+      )}
+      {wallet.botEnabled && config.automaticTrading && !config.automaticTrading.enabled && (
+        <p className="muted small-text">Automatic trading is switched off on the server, so the bot only trades when asked.</p>
       )}
       {wallet.botEnabled ? (
         <>
