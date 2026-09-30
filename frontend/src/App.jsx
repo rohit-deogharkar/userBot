@@ -35,7 +35,11 @@ export default function App() {
 
   const chain = useMemo(() => (config ? chainFromConfig(config) : null), [config]);
   const clients = useMemo(() => (chain && hasMetaMask() ? createClients(chain) : null), [chain]);
-  const signedIn = Boolean(session && account && session.address.toLowerCase() === account.toLowerCase());
+  const signedIn = Boolean(session);
+  // The MetaMask address linked to this login, once the user has linked one.
+  const linked = me?.address ?? null;
+  // Wallet actions need MetaMask connected on the linked account.
+  const walletReady = Boolean(account && linked && account.toLowerCase() === linked.toLowerCase());
 
   // Keep trying until the backend answers, so starting the frontend first doesn't leave the page stuck.
   useEffect(() => {
@@ -65,10 +69,7 @@ export default function App() {
   useEffect(() => {
     if (!hasMetaMask()) return;
     window.ethereum.request({ method: "eth_accounts" }).then((accounts) => setAccount(accounts[0] ?? null));
-    const onAccounts = (accounts) => {
-      setAccount(accounts[0] ?? null);
-      setMe(null);
-    };
+    const onAccounts = (accounts) => setAccount(accounts[0] ?? null);
     window.ethereum.on?.("accountsChanged", onAccounts);
     return () => window.ethereum.removeListener?.("accountsChanged", onAccounts);
   }, []);
@@ -119,7 +120,16 @@ export default function App() {
       setAccount(address);
     });
 
-  const signIn = () =>
+  const logIn = (mode, username, password) =>
+    run(mode === "signup" ? "Creating your login…" : "Logging in…", async () => {
+      const result = await api.post(mode === "signup" ? "/auth/signup" : "/auth/login", { username, password });
+      const next = { token: result.token, username: result.username };
+      saveSession(next);
+      setSession(next);
+    });
+
+  /** Links the connected MetaMask to this login with one free signature. Done once per login. */
+  const linkWallet = () =>
     run("Sign the message in MetaMask…", async () => {
       await ensureChain(clients.wallet, chain);
       const { nonce } = await api.get("/auth/nonce");
@@ -130,13 +140,12 @@ export default function App() {
         nonce,
         uri: window.location.origin,
         version: "1",
-        statement: "Sign in to userDexBot. Signing is free and does not give access to your funds.",
+        statement: `Link this MetaMask to the userDexBot login "${session.username}". Signing is free and does not give access to your funds.`,
       });
       const signature = await clients.wallet.signMessage({ account, message });
-      const result = await api.post("/auth/verify", { message, signature });
-      const next = { address: result.address, token: result.token };
-      saveSession(next);
-      setSession(next);
+      await api.post("/auth/link-wallet", { message, signature });
+      await refresh();
+      return "MetaMask is linked to your login.";
     });
 
   /**
@@ -230,6 +239,19 @@ export default function App() {
     });
 
   const wallet = me?.wallet;
+  const onboardingStep = !signedIn
+    ? "login"
+    : !me
+      ? "loading"
+      : !account
+        ? "connect"
+        : !linked
+          ? "link"
+          : !walletReady
+            ? "switch"
+            : "create";
+  // Deposit, withdraw, enable and stop all open MetaMask, so they wait until it's on the linked account.
+  const walletBusy = busy || (walletReady ? null : "Connect MetaMask first");
 
   return (
     <div className="app">
@@ -240,10 +262,11 @@ export default function App() {
         </div>
         <div className="topbar-right">
           {config && <span className="chip">{config.chain.name}</span>}
+          {signedIn && <span className="chip">{session.username}</span>}
           {account && <span className="chip mono">{shortAddress(account)}</span>}
           {signedIn && (
             <button className="link-button" onClick={signOut}>
-              Sign out
+              Log out
             </button>
           )}
         </div>
@@ -252,45 +275,65 @@ export default function App() {
       <main>
         {configError && <p className="banner error">Cannot reach the backend: {configError}. Is it running on port 4000?</p>}
 
-        {!signedIn || !wallet ? (
+        {!signedIn || !me || !linked || !wallet ? (
           <Onboarding
+            step={onboardingStep}
             hasMetaMask={hasMetaMask()}
             ready={Boolean(config)}
             account={account}
-            signedIn={signedIn}
-            loadingWallet={signedIn && !me}
+            linked={linked}
             busy={busy}
+            onLogin={logIn}
             onConnect={connect}
-            onSignIn={signIn}
+            onLink={linkWallet}
             onCreateWallet={createWallet}
           />
         ) : (
-          <div className="dashboard">
-            <div className="column">
-              <WalletCard config={config} owner={account} wallet={wallet} />
-              <DepositForm config={config} busy={busy} ownerBalances={me.ownerBalances} onDeposit={deposit} />
-              <WithdrawForm
-                config={config}
-                busy={busy}
-                balances={wallet.balances}
-                onWithdraw={(token, amount) =>
-                  walletAction({ kind: "withdraw", token, amount }, "Confirm the withdrawal in MetaMask…", "Withdrawal sent to your MetaMask.")
-                }
-              />
+          <>
+            {!walletReady && (
+              <div className="banner warning wallet-banner">
+                {!account ? (
+                  <>
+                    <span>Connect MetaMask to deposit, withdraw or change the bot.</span>
+                    <button className="small" disabled={Boolean(busy) || !hasMetaMask()} onClick={connect}>
+                      Connect MetaMask
+                    </button>
+                  </>
+                ) : (
+                  <span>
+                    MetaMask is on {shortAddress(account)}, but this login is linked to <span className="mono">{linked}</span>. Switch to that
+                    account in MetaMask.
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="dashboard">
+              <div className="column">
+                <WalletCard config={config} owner={linked} wallet={wallet} />
+                <DepositForm config={config} busy={walletBusy} ownerBalances={me.ownerBalances} onDeposit={deposit} />
+                <WithdrawForm
+                  config={config}
+                  busy={walletBusy}
+                  balances={wallet.balances}
+                  onWithdraw={(token, amount) =>
+                    walletAction({ kind: "withdraw", token, amount }, "Confirm the withdrawal in MetaMask…", "Withdrawal sent to your MetaMask.")
+                  }
+                />
+              </div>
+              <div className="column">
+                <BotControl
+                  config={config}
+                  wallet={wallet}
+                  busy={walletBusy}
+                  onEnable={enableBot}
+                  permission={permission}
+                  onStop={() => walletAction({ kind: "stop-bot" }, "Confirm stopping the bot in MetaMask…", "The bot is stopped.")}
+                />
+                {config.testTradesEnabled && <TestTrade config={config} busy={busy} botEnabled={wallet.botEnabled} onTrade={testTrade} />}
+                <Activity config={config} actions={me.actions} trades={me.trades} />
+              </div>
             </div>
-            <div className="column">
-              <BotControl
-                config={config}
-                wallet={wallet}
-                busy={busy}
-                onEnable={enableBot}
-                permission={permission}
-                onStop={() => walletAction({ kind: "stop-bot" }, "Confirm stopping the bot in MetaMask…", "The bot is stopped.")}
-              />
-              {config.testTradesEnabled && <TestTrade config={config} busy={busy} botEnabled={wallet.botEnabled} onTrade={testTrade} />}
-              <Activity config={config} actions={me.actions} trades={me.trades} />
-            </div>
-          </div>
+          </>
         )}
       </main>
 

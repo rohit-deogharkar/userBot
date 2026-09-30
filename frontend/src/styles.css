@@ -243,6 +243,16 @@ main {
   margin: 0;
 }
 
+.banner.wallet-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 20px;
+  overflow-wrap: anywhere;
+}
+
 /* Buttons and inputs */
 
 button {
@@ -322,10 +332,15 @@ select {
   min-width: 0;
 }
 
-.amount-form {
+.amount-form,
+.login-form {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.login-form .link-button {
+  align-self: center;
 }
 
 .field-row {

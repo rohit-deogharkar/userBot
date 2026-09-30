@@ -34,10 +34,12 @@ export const api = {
 
 const SESSION_KEY = "userDexBot.session";
 
+/** The saved login, { token, username }, or null. */
 export function loadSession() {
   try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? JSON.parse(raw) : null;
+    const session = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null");
+    // Sessions from before username logins have no username, and need a fresh login.
+    return session?.token && session?.username ? session : null;
   } catch {
     return null;
   }

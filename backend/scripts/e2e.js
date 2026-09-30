@@ -41,10 +41,10 @@ async function step(name, fn) {
 }
 
 let token;
-async function api(method, path, body) {
+async function api(method, path, body, authToken = token) {
   const res = await fetch(`${API}${path}`, {
     method,
-    headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { "content-type": "application/json", ...(authToken ? { authorization: `Bearer ${authToken}` } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const json = await res.json();
@@ -151,19 +151,71 @@ await step("Fund the test user with BNB, USDT and DEOD", async () => {
   return `${fmt(b.USDT)} USDT, ${fmt(b.DEOD)} DEOD`;
 });
 
-await step("Sign in with Ethereum", async () => {
+const username = `e2e_${user.address.slice(2, 12).toLowerCase()}`;
+const password = "correct horse battery staple";
+
+/** A one-time message linking `address` to a login, signed by `signer`. */
+async function linkMessage(address, signer) {
   const { nonce } = await api("GET", "/auth/nonce");
   const message = createSiweMessage({
-    address: user.address,
+    address,
     chainId: config.chain.id,
     domain: config.appDomain,
     nonce,
     uri: config.appOrigin,
     version: "1",
-    statement: "Sign in to userDexBot.",
+    statement: "Link this MetaMask to my userDexBot login.",
   });
-  ({ token } = await api("POST", "/auth/verify", { message, signature: await user.signMessage({ message }) }));
+  return { message, signature: await signer.signMessage({ message }) };
+}
+
+async function expectRefused(promise, what) {
+  try {
+    await promise;
+  } catch (error) {
+    return errorText(error);
+  }
+  throw new Error(`${what} was accepted.`);
+}
+
+await step("User creates a username and password login", async () => {
+  const session = await api("POST", "/auth/signup", { username, password });
+  assert.ok(session.token);
+  assert.equal(session.address, null);
+});
+
+await step("The same username can't be taken twice", () =>
+  expectRefused(api("POST", "/auth/signup", { username, password: "another password" }), "A duplicate username"),
+);
+
+await step("A wrong password is refused", () =>
+  expectRefused(api("POST", "/auth/login", { username, password: "wrong password" }), "A wrong password"),
+);
+
+await step("User logs in with the username and password", async () => {
+  ({ token } = await api("POST", "/auth/login", { username: username.toUpperCase(), password }));
   assert.ok(token);
+});
+
+await step("Wallet actions are refused until MetaMask is linked", () =>
+  expectRefused(api("POST", "/wallet/create-tx"), "A wallet action without a linked MetaMask"),
+);
+
+await step("Someone else's signature can't link the user's MetaMask", async () =>
+  expectRefused(api("POST", "/auth/link-wallet", await linkMessage(user.address, stranger)), "A forged link"),
+);
+
+await step("User links their MetaMask with one free signature", async () => {
+  const linked = await api("POST", "/auth/link-wallet", await linkMessage(user.address, user));
+  assert.equal(linked.address, user.address);
+  const me = await api("GET", "/me");
+  assert.equal(me.username, username);
+  assert.equal(me.address, user.address);
+});
+
+await step("Another login can't link the same MetaMask", async () => {
+  const other = await api("POST", "/auth/signup", { username: `${username}_2`, password });
+  return expectRefused(api("POST", "/auth/link-wallet", await linkMessage(user.address, user), other.token), "A second link");
 });
 
 await step("User creates their MetaMask smart account, pays the gas, and signs the owner permission", async () => {

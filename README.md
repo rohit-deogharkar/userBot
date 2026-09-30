@@ -19,6 +19,8 @@ User's MetaMask ──owns──▶ MetaMask smart account ◀──signed permi
 
 | User action | What MetaMask asks for | Gas |
 |---|---|---|
+| Create a login, or log in | Nothing. A username and password on our site. | None |
+| Link MetaMask to the login | One free signature, the first time only | None |
 | Create smart account | One transaction, plus one free signature (the owner permission) | User pays |
 | Deposit | One transfer: DEOD or USDT to trade, or a little BNB for the bot's gas | User pays |
 | Enable bot | One free signature (the bot's permission). No transaction. | None |
@@ -26,6 +28,14 @@ User's MetaMask ──owns──▶ MetaMask smart account ◀──signed permi
 | Withdraw | One transaction, through the owner permission | User pays |
 
 The bot runs on the server, not in the browser, so it keeps trading while the user is logged out. It stops only when the user sends "Stop bot".
+
+## Logins
+
+Users log in with a username and password, then link their MetaMask once. Linking is a signed message (Sign-In with Ethereum). Without it, anyone could claim someone else's wallet address and trigger trades on it. Each login links one MetaMask, each MetaMask belongs to one login, and the link can't be changed.
+
+The login only identifies the user to this app. It gives no access to funds: deposits, withdrawals, and enabling or stopping the bot all still need MetaMask's own confirmation. If the MetaMask in the browser is on a different account than the linked one, the page says so and waits.
+
+Passwords are stored only as salted scrypt hashes. Ten wrong passwords for one username from one IP address lock that combination out for 15 minutes. The code is in [backend/src/auth.js](backend/src/auth.js).
 
 ## What the bot can and cannot do
 
@@ -80,8 +90,9 @@ backend/    Node.js + Express API and the bot
   src/metamask.js      Smart accounts, the owner and bot permissions, and transaction encoding
   src/bot.js           Quotes, swaps and the gas repayment, as one transaction
   src/wallets.js       Account creation, enable, stop, withdraw and trades
+  src/auth.js          Username and password logins, and linking MetaMask
   src/kms.js           Bot key signer backed by AWS KMS
-  src/db.js            MongoDB: users, walletActions, trades, loginNonces
+  src/db.js            MongoDB: members (logins), users (smart accounts), walletActions, trades, loginNonces
   src/strategy/        Where the trading strategy plugs in (currently empty)
   scripts/e2e.js       End-to-end proof, including theft attempts
   scripts/fund.js      Gives a test address USDT and DEOD (and BNB on local nodes)
@@ -118,7 +129,8 @@ This uses the real mainnet contracts with fake money, and needs Foundry's `anvil
 
 `npm run e2e` runs on a local anvil node, against a copy of BNB Chain or of BNB testnet. It plays a user through the real API, with the user sending and paying for every transaction, then attacks with the bot key:
 
-- **Setup.** The user creates the smart account, signs the owner permission, deposits DEOD, USDT and BNB, and enables the bot with one free signature. A stranger's signature and a reused permission are both refused.
+- **Logins.** The user creates a login and logs in. A taken username and a wrong password are refused. Wallet actions are refused until MetaMask is linked. A stranger's signature can't link the user's MetaMask, and a second login can't link it either.
+- **Setup.** The user links MetaMask with one signature, creates the smart account, signs the owner permission, deposits DEOD, USDT and BNB, and enables the bot with one free signature. A stranger's signature and a reused permission are both refused.
 - **Trades and gas.** Two trades. In each, the user's BNB repays the bot's gas in the same transaction, and the bot ends up repaid in full. The gas budget and daily limits go down by exactly what was used.
 - **Theft attempts blocked on-chain.** The bot key can't:
   - send BNB anywhere but its own address, go 1 wei over the daily gas cap, or attach call data to the repayment;
@@ -153,7 +165,8 @@ Settings are in `backend/.env` for the local copy and `backend/.env.testnet` for
 | Method and path | What it does |
 |---|---|
 | `GET /api/config` | Network, tokens, bot address, rules, limits and the gas cap |
-| `GET /api/auth/nonce`, `POST /api/auth/verify` | Sign-In with Ethereum |
+| `POST /api/auth/signup`, `POST /api/auth/login` | Create a login, or log in, with a username and password |
+| `GET /api/auth/nonce`, `POST /api/auth/link-wallet` | Link MetaMask to the login with a signed message (Sign-In with Ethereum) |
 | `GET /api/me` | Balances, bot status, limits and gas budget left, recent activity |
 | `POST /api/wallet/create-tx` | The smart account creation transaction and the owner permission to sign |
 | `POST /api/wallet` | Records the smart account with the signed owner permission |
@@ -173,7 +186,7 @@ Write it in [backend/src/strategy/strategy.js](backend/src/strategy/strategy.js)
 2. **Bot key in KMS.** Set `BOT_KMS_KEY_ID` and remove `BOT_PRIVATE_KEY`. Keep a small BNB balance on the bot address, and alert when it runs low.
 3. **Trade size limits.** They aren't enforced on-chain, so keep daily limits and deposits modest. An on-chain volume cap would need a custom caveat enforcer contract, which would need an audit.
 4. **Frontend hosting.** Host the frontend separately from the API with locked-down deployments.
-5. **Sessions.** Move the login token from browser storage to an httpOnly cookie.
+5. **Logins.** Move the login token from browser storage to an httpOnly cookie. Add an email address for password resets; there is none yet, so a forgotten password means a new login, and the MetaMask stays linked to the old one. Behind a load balancer, set Express's `trust proxy` so lockouts see real IP addresses. With more than one server, keep the lockout counts in a shared store such as Redis, since each server counts separately today.
 6. **Database.** Use a managed MongoDB deployment with authentication, TLS and backups.
 7. **Outside review.** Get the permission rules and the integration reviewed by a smart-contract auditor.
 8. **Legal review.** Confirm obligations for an automated trading service in your market.

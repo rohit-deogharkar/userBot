@@ -16,6 +16,9 @@ export async function connectDb() {
   await Promise.all([
     // MongoDB deletes each login nonce automatically once expiresAt has passed.
     collection("loginNonces").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    collection("members").createIndex({ username: 1 }, { unique: true }),
+    // One MetaMask can be linked to only one login.
+    collection("members").createIndex({ address: 1 }, { unique: true, partialFilterExpression: { address: { $type: "string" } } }),
     collection("users").createIndex({ address: 1, chainId: 1 }, { unique: true }),
     collection("walletActions").createIndex({ owner: 1, createdAt: -1 }),
     // One blockchain transaction can confirm only one wallet action.
@@ -45,6 +48,47 @@ export const nonces = {
   },
 };
 
+const isDuplicate = (error) => error?.code === 11000;
+
+/** Logins: a username, a password hash, and the MetaMask address linked to them (null until linked). */
+export const members = {
+  /** Creates a login. Returns null if the username is taken. */
+  async create({ id, username, passwordHash }) {
+    const doc = { _id: id, username, passwordHash, address: null, createdAt: new Date() };
+    try {
+      await collection("members").insertOne(doc);
+      return doc;
+    } catch (error) {
+      if (isDuplicate(error)) return null;
+      throw error;
+    }
+  },
+  async get(id) {
+    return collection("members").findOne({ _id: id });
+  },
+  async findByUsername(username) {
+    return collection("members").findOne({ username });
+  },
+  /**
+   * Links a MetaMask address to a login that has none yet.
+   * Returns the updated login, "already-linked" if the login has an address, or "address-taken" if another login has this one.
+   */
+  async linkAddress(id, address) {
+    try {
+      const doc = await collection("members").findOneAndUpdate(
+        { _id: id, address: null },
+        { $set: { address: address.toLowerCase(), linkedAt: new Date() } },
+        { returnDocument: "after" },
+      );
+      return doc ?? "already-linked";
+    } catch (error) {
+      if (isDuplicate(error)) return "address-taken";
+      throw error;
+    }
+  },
+};
+
+/** Smart accounts and bot permissions, one per MetaMask address. */
 export const users = {
   async get(address) {
     return collection("users").findOne({ address: address.toLowerCase(), chainId: config.chain.id });

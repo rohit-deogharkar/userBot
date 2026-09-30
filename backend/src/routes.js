@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { formatEther, parseUnits } from "viem";
-import { issueNonce, requireAuth, verifyLogin } from "./auth.js";
+import { issueNonce, linkWallet, logIn, requireAuth, requireWallet, signUp } from "./auth.js";
 import { botAccount } from "./chain.js";
 import { ADDRESSES, TOKENS, config } from "./config.js";
 import { toJson, trades, users, walletActions } from "./db.js";
@@ -64,32 +64,36 @@ router.get("/config", (_req, res) => {
   });
 });
 
-router.get("/auth/nonce", async (_req, res) => res.json({ nonce: await issueNonce() }));
+// Username and password login.
+router.post("/auth/signup", async (req, res) => res.json(await signUp(req.body)));
+router.post("/auth/login", async (req, res) => res.json(await logIn(req.body, req.ip)));
 
-router.post("/auth/verify", async (req, res) => {
-  const { message, signature } = req.body ?? {};
-  if (!message || !signature) throw new HttpError(400, "Missing sign-in message or signature.");
-  res.json(await verifyLogin(message, signature));
-});
+// Linking MetaMask to the login: a one-time message to sign, then the signature.
+router.get("/auth/nonce", async (_req, res) => res.json({ nonce: await issueNonce() }));
+router.post("/auth/link-wallet", requireAuth, async (req, res) => res.json(await linkWallet(req.user, req.body)));
+
+// Everything below acts on the MetaMask linked to the login.
+const withWallet = [requireAuth, requireWallet];
 
 router.get("/me", requireAuth, async (req, res) => {
-  const owner = req.user.address;
+  const { username, address: owner } = req.user;
+  if (!owner) return send(res, { username, address: null, ownerBalances: null, wallet: null, actions: [], trades: [] });
   const [ownerBalances, user, actions, recentTrades] = await Promise.all([
     getBalances(owner),
     users.get(owner),
     walletActions.recent(owner),
     trades.recent(owner),
   ]);
-  send(res, { address: owner, ownerBalances, wallet: await getWalletInfo(user), actions, trades: recentTrades });
+  send(res, { username, address: owner, ownerBalances, wallet: await getWalletInfo(user), actions, trades: recentTrades });
 });
 
 // Creating the smart account, step 1: the transaction to send and the owner permission to sign.
-router.post("/wallet/create-tx", requireAuth, async (req, res) => {
+router.post("/wallet/create-tx", withWallet, async (req, res) => {
   send(res, await prepareCreateWallet(req.user.address));
 });
 
 // Step 2: after the transaction is mined, record the account with the signed owner permission.
-router.post("/wallet", requireAuth, async (req, res) => {
+router.post("/wallet", withWallet, async (req, res) => {
   const { signature } = req.body ?? {};
   if (signature && !isSignature(signature)) throw new HttpError(400, "Invalid signature.");
   const user = await syncBotWallet(req.user.address, signature);
@@ -97,29 +101,29 @@ router.post("/wallet", requireAuth, async (req, res) => {
 });
 
 // Enabling the bot: the permission to sign, then the signature. No transaction and no gas.
-router.post("/bot/permission", requireAuth, async (req, res) => {
+router.post("/bot/permission", withWallet, async (req, res) => {
   send(res, await prepareEnableBot(req.user.address));
 });
 
-router.post("/bot/permission/:id", requireAuth, async (req, res) => {
+router.post("/bot/permission/:id", withWallet, async (req, res) => {
   const { signature } = req.body ?? {};
   if (!isSignature(signature)) throw new HttpError(400, "Missing signature.");
   send(res, await confirmEnableBot(req.user.address, req.params.id, signature));
 });
 
 // Stop and withdraw: a transaction the user sends from MetaMask, then confirms here.
-router.post("/wallet/actions", requireAuth, async (req, res) => {
+router.post("/wallet/actions", withWallet, async (req, res) => {
   send(res, await prepareWalletAction(req.user.address, req.body ?? {}));
 });
 
-router.post("/wallet/actions/:id/confirm", requireAuth, async (req, res) => {
+router.post("/wallet/actions/:id/confirm", withWallet, async (req, res) => {
   const { txHash } = req.body ?? {};
   if (!isHex32(txHash)) throw new HttpError(400, "Missing transaction hash.");
   send(res, await confirmWalletAction(req.user.address, req.params.id, txHash));
 });
 
 // Lets you trigger one swap by hand while the real strategy is being built.
-router.post("/bot/test-trade", requireAuth, async (req, res) => {
+router.post("/bot/test-trade", withWallet, async (req, res) => {
   if (!config.enableTestTrades) throw new HttpError(403, "Test trades are turned off.");
   const { sell, amount } = req.body ?? {};
   const token = TOKENS[sell];
