@@ -49,22 +49,32 @@ export const users = {
   async get(address) {
     return collection("users").findOne({ address: address.toLowerCase(), chainId: config.chain.id });
   },
-  async upsertWallet(address, safeAddress, rolesAddress) {
+  /** Records the user's smart account and the owner delegation they signed for it. */
+  async saveAccount(address, account, ownerDelegation) {
     return collection("users").findOneAndUpdate(
       { address: address.toLowerCase(), chainId: config.chain.id },
-      { $set: { safeAddress, rolesAddress }, $setOnInsert: { createdAt: new Date() } },
+      { $set: { account, ownerDelegation }, $setOnInsert: { botDelegation: null, createdAt: new Date() } },
       { upsert: true, returnDocument: "after" },
     );
   },
-  async withWallet() {
-    return collection("users").find({ chainId: config.chain.id, rolesAddress: { $ne: null } }).toArray();
+  /** Stores the bot permission the user signed, or clears it. */
+  async setBotDelegation(address, botDelegation) {
+    return collection("users").findOneAndUpdate(
+      { address: address.toLowerCase(), chainId: config.chain.id },
+      { $set: { botDelegation } },
+      { returnDocument: "after" },
+    );
+  },
+  /** Users whose bot the strategy runner should consider. */
+  async withBotPermission() {
+    return collection("users").find({ chainId: config.chain.id, botDelegation: { $ne: null } }).toArray();
   },
 };
 
-const actionView = ({ _id, owner, safeAddress, kind, summary, status, txHash, error, createdAt }) => ({
+const actionView = ({ _id, owner, account, kind, summary, status, txHash, error, createdAt }) => ({
   id: _id,
   owner,
-  safeAddress,
+  account,
   kind,
   summary,
   status,
@@ -74,14 +84,19 @@ const actionView = ({ _id, owner, safeAddress, kind, summary, status, txHash, er
 });
 
 export const walletActions = {
-  async create({ id, owner, safeAddress, kind, summary, safeTx }) {
+  /**
+   * A pending action for the user: either a transaction to send from MetaMask (tx),
+   * or a bot permission to sign (delegation).
+   */
+  async create({ id, owner, account, kind, summary, tx = null, delegation = null }) {
     await collection("walletActions").insertOne({
       _id: id,
       owner: owner.toLowerCase(),
-      safeAddress,
+      account,
       kind,
       summary,
-      safeTx: withBigintsAsStrings(safeTx),
+      tx: tx ? withBigintsAsStrings(tx) : null,
+      delegation,
       status: "awaiting_signature",
       createdAt: new Date(),
     });
@@ -98,11 +113,7 @@ export const walletActions = {
       { returnDocument: "after" },
     );
     if (!doc) return null;
-    const tx = doc.safeTx;
-    return {
-      ...actionView(doc),
-      safeTx: { ...tx, value: BigInt(tx.value), safeTxGas: 0n, baseGas: 0n, gasPrice: 0n, nonce: BigInt(tx.nonce) },
-    };
+    return { ...actionView(doc), tx: doc.tx ? { ...doc.tx, value: BigInt(doc.tx.value) } : null, delegation: doc.delegation };
   },
   async find(id, owner) {
     const doc = await collection("walletActions").findOne({ _id: id, owner: owner.toLowerCase() });
@@ -121,13 +132,14 @@ export const trades = {
   async record(trade) {
     await collection("trades").insertOne({
       owner: trade.owner.toLowerCase(),
-      safeAddress: trade.safeAddress,
+      account: trade.account,
       tokenIn: trade.tokenIn,
       tokenOut: trade.tokenOut,
       amountIn: String(trade.amountIn),
       minOut: trade.minOut == null ? null : String(trade.minOut),
       amountOut: trade.amountOut == null ? null : String(trade.amountOut),
-      fee: trade.fee == null ? null : String(trade.fee),
+      // BNB the user's smart account paid for this trade's gas.
+      gasFee: trade.gasFee == null ? null : String(trade.gasFee),
       txHash: trade.txHash ?? null,
       status: trade.status,
       error: trade.error ?? null,
@@ -138,5 +150,14 @@ export const trades = {
   async recent(owner) {
     const docs = await collection("trades").find({ owner: owner.toLowerCase() }).sort({ createdAt: -1 }).limit(20).toArray();
     return docs.map(({ _id, ...rest }) => ({ id: _id.toString(), ...rest }));
+  },
+  /** How much of a token the bot sold for this user in the last 24 hours. */
+  async soldInLastDay(owner, tokenSymbol) {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const docs = await collection("trades")
+      .find({ owner: owner.toLowerCase(), tokenIn: tokenSymbol, status: "success", createdAt: { $gte: since } })
+      .project({ amountIn: 1 })
+      .toArray();
+    return docs.reduce((sum, d) => sum + BigInt(d.amountIn), 0n);
   },
 };

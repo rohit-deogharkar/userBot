@@ -13,7 +13,7 @@ import {
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { erc20Abi, swapRouterAbi, wethAbi } from "../src/abis.js";
-import { deployerAccount, deployerClient, publicClient } from "../src/chain.js";
+import { botAccount, deployerAccount, deployerClient, publicClient } from "../src/chain.js";
 import { ADDRESSES, TOKENS, config } from "../src/config.js";
 
 if (config.networkName === "bsc") {
@@ -107,6 +107,9 @@ async function fundOnTestnet(address, { bnb = "10", usdt = "1000", deod = "50000
 
 /** Gives an address test BNB (where possible), USDT and DEOD. */
 export async function fundAddress(address, options = {}) {
+  // Anvil's public test keys have sweeper contracts attached on the real BNB Chain (EIP-7702), which would
+  // forward away the gas repayments the bot receives. Local copies inherit them, so clear the bot's address.
+  if (await isLocalNode()) await testClient.setCode({ address: botAccount.address, bytecode: "0x" });
   return config.networkName === "bsc-testnet" ? fundOnTestnet(address, options) : fundOnMainnetFork(address, options);
 }
 

@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, getAddress, http } from "viem";
+import { createPublicClient, createWalletClient, http, nonceManager } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { config } from "./config.js";
 import { createKmsAccount } from "./kms.js";
@@ -7,19 +7,17 @@ const transport = http(config.rpcUrl);
 
 export const publicClient = createPublicClient({ chain: config.chain, transport });
 
-// The trade-only key. Its only power is what each user's Roles module allows.
+// The bot's key. Its only power is what each user's signed MetaMask permission allows.
 // With BOT_KMS_KEY_ID set, the key stays inside AWS KMS and is never visible to anyone.
+// Transaction numbers (nonces) are tracked locally, because public RPC endpoints can briefly report stale ones.
 export const botAccount = config.botKmsKeyId
   ? await createKmsAccount({ keyId: config.botKmsKeyId })
-  : privateKeyToAccount(config.botPrivateKey);
+  : privateKeyToAccount(config.botPrivateKey, { nonceManager });
 export const botClient = createWalletClient({ account: botAccount, chain: config.chain, transport });
-
-// Receives the per-trade network fee. Defaults to the bot itself, since the bot pays the trade gas.
-export const feeCollector = getAddress(config.feeCollector || botAccount.address);
 
 // Only for the testnet setup and test-funding scripts. The running app never uses it:
 // users send their own wallet transactions from MetaMask and pay their own gas.
-export const deployerAccount = config.deployerPrivateKey ? privateKeyToAccount(config.deployerPrivateKey) : null;
+export const deployerAccount = config.deployerPrivateKey ? privateKeyToAccount(config.deployerPrivateKey, { nonceManager }) : null;
 export const deployerClient = deployerAccount ? createWalletClient({ account: deployerAccount, chain: config.chain, transport }) : null;
 
 // Sending two transactions from the same key at once can reuse a nonce.

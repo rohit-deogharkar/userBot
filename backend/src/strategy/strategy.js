@@ -5,12 +5,12 @@
  * Return null to do nothing, or { sell: "DEOD" | "USDT", amountIn: bigint } to make one swap.
  * Amounts use 18 decimals for both tokens, so 1 USDT is 10n ** 18n.
  *
- * The strategy never touches keys. It only returns a decision, and the user's
- * Roles module still checks every trade against their on-chain rules.
+ * The strategy never touches keys. It only returns a decision, and the permission the user
+ * signed still limits every trade on-chain.
  *
  * @param {object} context
  * @param {string} context.owner              The user's MetaMask address
- * @param {string} context.safeAddress        Their bot wallet
+ * @param {string} context.account            Their MetaMask smart account
  * @param {{DEOD: bigint, USDT: bigint, BNB: bigint}} context.balances
  * @param {{DEOD: bigint, USDT: bigint}} context.remainingToday   What the daily limits still allow
  */

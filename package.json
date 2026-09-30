@@ -1,0 +1,9 @@
+{
+  "name": "userdexbot",
+  "private": true,
+  "description": "Starts the server and the website together. See README.md.",
+  "scripts": {
+    "testnet": "node scripts/start.mjs testnet",
+    "start": "node scripts/start.mjs"
+  }
+}

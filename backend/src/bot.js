@@ -1,24 +1,10 @@
-import { encodeFunctionData, formatUnits, maxUint256 } from "viem";
-import { erc20Abi, quoterV2Abi, rolesAbi, swapRouterAbi } from "./abis.js";
-import { botClient, botQueue, feeCollector, publicClient, sendAndConfirm } from "./chain.js";
+import { encodeFunctionData, formatEther, formatUnits } from "viem";
+import { createExecution } from "@metamask/smart-accounts-kit";
+import { erc20Abi, quoterV2Abi, swapRouterAbi } from "./abis.js";
+import { botClient, botQueue, publicClient } from "./chain.js";
 import { ADDRESSES, TOKENS, config } from "./config.js";
-import { HttpError } from "./errors.js";
-import { ROLE_KEY } from "./permissions.js";
-import { feeRemainingToday } from "./roles.js";
-
-/**
- * Sends one call from the user's bot wallet through the Roles module.
- * The Roles module checks it against the user's rules and reverts if it breaks any of them.
- */
-export async function execWithRole(roles, to, data) {
-  const receipt = await sendAndConfirm(botClient, botQueue, {
-    address: roles,
-    abi: rolesAbi,
-    functionName: "execTransactionWithRole",
-    args: [to, 0n, data, 0, ROLE_KEY, true],
-  });
-  return receipt.transactionHash;
-}
+import { HttpError, describeError } from "./errors.js";
+import { GROUP, MM, approveExecution, encodeRedeem, gasBudgetLeftToday, gasRepayExecution, withGroup } from "./metamask.js";
 
 export async function quoteSwap(tokenIn, tokenOut, amountIn) {
   const { result } = await publicClient.simulateContract({
@@ -33,71 +19,101 @@ export async function quoteSwap(tokenIn, tokenOut, amountIn) {
 const balanceOf = (token, owner) =>
   publicClient.readContract({ address: token.address, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
 
-const usdt = (value) => `${formatUnits(value, TOKENS.USDT.decimals)} USDT`;
+const amount = (value, token) => `${formatUnits(value, token.decimals)} ${token.symbol}`;
+const bnb = (value) => `${formatEther(value)} ${config.nativeSymbol}`;
 
-/** Takes the flat network fee in USDT from the bot wallet. The rules cap it per day. */
-async function takeFee(roles, fee) {
-  const data = encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [feeCollector, fee] });
-  return execWithRole(roles, TOKENS.USDT.address, data);
+/**
+ * Sends the trade from the bot, with the user's smart account paying the bot back for the gas in the
+ * same transaction. The repayment is the gas estimate times the gas price the transaction pays.
+ * Gas estimates for delegation redemptions run tight, so the gas limit has a 30% margin; unused gas isn't charged.
+ */
+async function sendTrade({ account, delegation, items, gasBudget }) {
+  const botAddress = botClient.account.address;
+  const repay = (value) => ({ delegation: withGroup(delegation, GROUP.GAS), execution: gasRepayExecution(botAddress, value) });
+  return botQueue(async () => {
+    const gasPrice = await publicClient.getGasPrice();
+    let estimate;
+    try {
+      // Sending BNB costs the same gas whatever the amount, so a 1 wei placeholder gives the real estimate.
+      const data = encodeRedeem([...items, repay(1n)]);
+      estimate = await publicClient.estimateGas({ account: botAddress, to: MM.delegationManager, data });
+    } catch (error) {
+      // The permission or the swap would fail. Explain why without spending gas.
+      throw new HttpError(400, describeError(error).message);
+    }
+    const gasCost = estimate * gasPrice;
+    const held = await publicClient.getBalance({ address: account });
+    if (gasCost > held) {
+      throw new HttpError(400, `This trade's gas costs about ${bnb(gasCost)}, but the smart account holds ${bnb(held)}. Deposit some ${config.nativeSymbol}.`);
+    }
+    if (gasCost > gasBudget) {
+      throw new HttpError(400, `This trade's gas costs about ${bnb(gasCost)}, more than the ${bnb(gasBudget)} left in today's gas budget.`);
+    }
+    const data = encodeRedeem([...items, repay(gasCost)]);
+    const hash = await botClient.sendTransaction({ to: MM.delegationManager, data, gas: (estimate * 13n) / 10n, gasPrice });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") throw new Error(`Transaction ${hash} reverted`);
+    return { receipt, gasCost };
+  });
 }
 
 /**
- * Swaps tokenIn for tokenOut inside the user's bot wallet. Output always lands back in the same wallet.
- * The user pays the bot's gas through a flat USDT fee per trade, taken from the same wallet.
+ * Swaps tokenIn for tokenOut inside the user's smart account, using the permission they signed.
+ * The approval (if needed), the swap and the gas repayment go out as one transaction, so a trade
+ * can never happen without the user paying its gas.
  */
-export async function executeSwap({ safe, roles, tokenIn, tokenOut, amountIn }) {
-  const router = ADDRESSES.swapRouter;
-  const fee = config.rules.tradeFee;
-  const sellingUsdt = tokenIn.symbol === TOKENS.USDT.symbol;
-  const txHashes = [];
+export async function executeSwap({ account, delegation, tokenIn, tokenOut, amountIn, soldToday }) {
+  const { perTradeLimits, dailyLimits } = config.rules;
+
+  if (amountIn > perTradeLimits[tokenIn.symbol]) {
+    throw new HttpError(400, `One trade can sell at most ${amount(perTradeLimits[tokenIn.symbol], tokenIn)}.`);
+  }
+  if (soldToday + amountIn > dailyLimits[tokenIn.symbol]) {
+    throw new HttpError(400, `This would pass today's limit of ${amount(dailyLimits[tokenIn.symbol], tokenIn)} sold.`);
+  }
+
+  const [gasBudget, bnbHeld] = await Promise.all([gasBudgetLeftToday(delegation), publicClient.getBalance({ address: account })]);
+  if (bnbHeld === 0n) throw new HttpError(400, `The smart account has no ${config.nativeSymbol} to pay the bot's gas. Deposit a little first.`);
+  if (gasBudget === 0n) throw new HttpError(400, "Today's gas budget is used up. The bot will trade again tomorrow.");
 
   const quotedOut = await quoteSwap(tokenIn, tokenOut, amountIn);
   const minOut = (quotedOut * (10_000n - config.rules.slippageBps)) / 10_000n;
 
-  // Check the fee can be paid before trading, so the bot never trades without charging it.
-  if (fee > 0n) {
-    if ((await feeRemainingToday(roles)) < fee) {
-      throw new HttpError(400, "Today's network fee budget is used up. The bot will trade again tomorrow.");
-    }
-    const usdtBalance = await balanceOf(TOKENS.USDT, safe);
-    const usdtAvailable = sellingUsdt ? usdtBalance - amountIn : usdtBalance + minOut;
-    if (usdtAvailable < fee) {
-      throw new HttpError(400, `The bot wallet needs ${usdt(fee)} for the network fee on top of this trade.`);
-    }
-  }
-
+  const items = [];
   const allowance = await publicClient.readContract({
     address: tokenIn.address,
     abi: erc20Abi,
     functionName: "allowance",
-    args: [safe, router],
+    args: [account, ADDRESSES.swapRouter],
   });
-  if (allowance < amountIn) {
-    const approveData = encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [router, maxUint256] });
-    txHashes.push(await execWithRole(roles, tokenIn.address, approveData));
-  }
+  if (allowance < amountIn) items.push({ delegation: withGroup(delegation, GROUP.APPROVE), execution: approveExecution(tokenIn) });
 
-  const before = await balanceOf(tokenOut, safe);
-  const swapData = encodeFunctionData({
-    abi: swapRouterAbi,
-    functionName: "exactInputSingle",
-    args: [
-      {
-        tokenIn: tokenIn.address,
-        tokenOut: tokenOut.address,
-        fee: config.rules.poolFee,
-        recipient: safe,
-        amountIn,
-        amountOutMinimum: minOut,
-        sqrtPriceLimitX96: 0n,
-      },
-    ],
+  const swapGroup = tokenIn.symbol === TOKENS.USDT.symbol ? GROUP.SELL_USDT : GROUP.SELL_DEOD;
+  items.push({
+    delegation: withGroup(delegation, swapGroup),
+    execution: createExecution({
+      target: ADDRESSES.swapRouter,
+      callData: encodeFunctionData({
+        abi: swapRouterAbi,
+        functionName: "exactInputSingle",
+        args: [
+          {
+            tokenIn: tokenIn.address,
+            tokenOut: tokenOut.address,
+            fee: config.rules.poolFee,
+            recipient: account,
+            amountIn,
+            amountOutMinimum: minOut,
+            sqrtPriceLimitX96: 0n,
+          },
+        ],
+      }),
+    }),
   });
-  const swapTxHash = await execWithRole(roles, router, swapData);
-  txHashes.push(swapTxHash);
-  const after = await balanceOf(tokenOut, safe);
 
-  if (fee > 0n) txHashes.push(await takeFee(roles, fee));
+  const before = await balanceOf(tokenOut, account);
+  const { receipt, gasCost } = await sendTrade({ account, delegation, items, gasBudget });
+  const after = await balanceOf(tokenOut, account);
 
-  return { txHashes, swapTxHash, quotedOut, minOut, amountOut: after - before, fee };
+  return { txHash: receipt.transactionHash, gasUsed: receipt.gasUsed, quotedOut, minOut, amountOut: after - before, gasFee: gasCost };
 }

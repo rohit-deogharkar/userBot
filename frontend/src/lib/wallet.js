@@ -1,14 +1,4 @@
-import { concat, createPublicClient, createWalletClient, custom, defineChain, getAddress, pad, parseAbi } from "viem";
-
-export const safeExecAbi = parseAbi([
-  "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool success)",
-]);
-
-/**
- * The signature Safe accepts when the owner sends the transaction themselves.
- * Safe checks the sender is the owner, so MetaMask shows one transaction and no separate signature.
- */
-export const ownerSentSignature = (owner) => concat([pad(getAddress(owner)), pad("0x00"), "0x01"]);
+import { createPublicClient, createWalletClient, custom, defineChain, parseAbi } from "viem";
 
 export const hasMetaMask = () => typeof window !== "undefined" && Boolean(window.ethereum);
 
@@ -45,21 +35,20 @@ export async function ensureChain(wallet, chain) {
   }
 }
 
-/** The API sends bigints as strings. MetaMask signing through viem needs them as bigints. */
-export function reviveSafeTypedData(typedData) {
-  const m = typedData.message;
+/** The API sends bigints as strings. MetaMask signing through viem needs the delegation salt as a bigint. */
+export function reviveDelegationTypedData(typedData) {
   return {
     ...typedData,
-    message: {
-      ...m,
-      value: BigInt(m.value),
-      operation: Number(m.operation),
-      safeTxGas: BigInt(m.safeTxGas),
-      baseGas: BigInt(m.baseGas),
-      gasPrice: BigInt(m.gasPrice),
-      nonce: BigInt(m.nonce),
-    },
+    domain: { ...typedData.domain, chainId: Number(typedData.domain.chainId) },
+    message: { ...typedData.message, salt: BigInt(typedData.message.salt) },
   };
+}
+
+const nonceAbi = parseAbi(["function currentNonce(address _delegationManager, address _delegator) view returns (uint256)"]);
+
+/** Reads the smart account's stop-switch counter straight from the chain, not from the backend. */
+export function readCurrentNonce(reader, { nonceEnforcer, delegationManager, account }) {
+  return reader.readContract({ address: nonceEnforcer, abi: nonceAbi, functionName: "currentNonce", args: [delegationManager, account] });
 }
 
 export function friendlyError(error) {

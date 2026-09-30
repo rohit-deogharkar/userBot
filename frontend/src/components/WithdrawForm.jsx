@@ -13,7 +13,7 @@ export default function WithdrawForm({ config, busy, balances, onWithdraw }) {
         config={config}
         tokens={allSymbols(config)}
         balances={balances}
-        balanceLabel="In your bot wallet"
+        balanceLabel="In your smart account"
         submitLabel="Withdraw to MetaMask"
         busy={busy}
         maxSendsAll

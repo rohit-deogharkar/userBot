@@ -1,32 +1,33 @@
 // End-to-end proof on a local anvil node: a copy of BNB Chain (npm run e2e) or of BNB testnet
 // after testnet setup (npm run e2e:testnet with RPC_URL pointing at the local copy).
 //
-// It plays a user through the whole flow over the real HTTP API. The user sends every wallet
-// transaction from their own account and pays its gas. Then it uses the bot key directly to try
-// to take money from the wallet, and checks every attempt is blocked on-chain.
+// It plays a user through the whole flow over the real HTTP API, with the user sending and paying for
+// every transaction from their own account. Then it uses the bot key directly to try to take money
+// from the user's MetaMask smart account, and checks every attempt is blocked on-chain.
 import assert from "node:assert/strict";
-import { concat, encodeFunctionData, formatUnits, getAddress, pad, parseUnits, zeroAddress } from "viem";
+import { createExecution } from "@metamask/smart-accounts-kit";
+import { encodeFunctionData, formatUnits, maxUint256, parseEther, parseUnits } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { createSiweMessage } from "viem/siwe";
-import { erc20Abi, rolesAbi, safeAbi, swapRouterAbi } from "../src/abis.js";
-import { feeCollector } from "../src/chain.js";
+import { erc20Abi, swapRouterAbi } from "../src/abis.js";
 import { ADDRESSES, TOKENS, config } from "../src/config.js";
 import { describeRevert } from "../src/errors.js";
-import { ROLE_KEY } from "../src/permissions.js";
+import { GROUP, MM, accountOwner, encodeRedeem, withGroup } from "../src/metamask.js";
 import { fundAddress, isLocalNode, publicClient, walletFor } from "./test-funds.js";
 
 if (!(await isLocalNode())) {
   console.error(`The end-to-end proof only runs against a local anvil node. ${config.rpcUrl} is not one.`);
   process.exit(1);
 }
-// Any address that is not DEOD or USDT. The rules reject it before the swap is even attempted.
+// Any address that is not DEOD or USDT. The permission rejects it before the swap is even attempted.
 const UNLISTED_TOKEN = "0x000000000000000000000000000000000000dEaD";
 
 const API = process.env.API_URL || `http://localhost:${config.port}/api`;
 const { DEOD, USDT } = TOKENS;
-const FEE = config.rules.tradeFee;
+const BNB = config.nativeSymbol;
+const { dailyGasCap: GAS_CAP, perTradeLimits, dailyLimits } = config.rules;
 const results = [];
-const fmt = (amount) => Number(formatUnits(BigInt(amount), 18)).toLocaleString("en-US", { maximumFractionDigits: 4 });
+const fmt = (amount, digits = 4) => Number(formatUnits(BigInt(amount), 18)).toLocaleString("en-US", { maximumFractionDigits: digits });
 
 async function step(name, fn) {
   try {
@@ -50,76 +51,93 @@ async function api(method, path, body) {
   if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}: ${json.error}`);
   return json;
 }
+const errorText = (error) => error.message.split(": ").slice(1).join(": ");
+
+// The API sends bigints as strings. Signing needs the delegation salt back as a bigint.
+const revive = (typedData) => ({ ...typedData, message: { ...typedData.message, salt: BigInt(typedData.message.salt) } });
 
 const user = privateKeyToAccount(generatePrivateKey());
 const userWallet = walletFor(user);
 const bot = privateKeyToAccount(config.botPrivateKey);
-
-// Safe accepts this signature when the owner sends execTransaction themselves.
-const ownerSentSignature = (owner) => concat([pad(getAddress(owner)), pad("0x00"), "0x01"]);
-
-/** The user sends a wallet action from their own account, then the backend confirms it. */
-let lastSent;
-async function sendAction(body, from = user) {
-  const action = await api("POST", "/wallet/actions", body);
-  const m = action.typedData.message;
-  const hash = await walletFor(from).writeContract({
-    address: wallet.safeAddress,
-    abi: safeAbi,
-    functionName: "execTransaction",
-    args: [m.to, BigInt(m.value), m.data, Number(m.operation), 0n, 0n, 0n, zeroAddress, zeroAddress, ownerSentSignature(user.address)],
-  });
-  await publicClient.waitForTransactionReceipt({ hash });
-  lastSent = { id: action.id, hash };
-  return api("POST", `/wallet/actions/${action.id}/confirm`, { txHash: hash });
-}
+const stranger = privateKeyToAccount(generatePrivateKey());
 
 const balance = (tokenInfo, address) =>
   publicClient.readContract({ address: tokenInfo.address, abi: erc20Abi, functionName: "balanceOf", args: [address] });
+const bnbOf = (address) => publicClient.getBalance({ address });
 
-/** Simulates a call as the bot key through the Roles module, without changing anything on-chain. */
-const simulateAsBot = (roles, to, data) =>
-  publicClient.simulateContract({
-    account: bot,
-    address: roles,
-    abi: rolesAbi,
-    functionName: "execTransactionWithRole",
-    args: [to, 0n, data, 0, ROLE_KEY, true],
-  });
-
-/** Returns the revert reason, or throws if the bot's call went through. */
-async function expectBlocked(roles, to, data) {
-  try {
-    await simulateAsBot(roles, to, data);
-  } catch (error) {
-    return describeRevert(error) ?? error.shortMessage;
-  }
-  throw new Error("The bot was able to do this. It should have been blocked.");
+/** The user sends a wallet action from their own account, then the backend confirms it. */
+let lastSent;
+async function sendAction(body) {
+  const action = await api("POST", "/wallet/actions", body);
+  assert.equal(action.tx.to.toLowerCase(), MM.delegationManager.toLowerCase());
+  const hash = await userWallet.sendTransaction({ to: action.tx.to, data: action.tx.data, value: BigInt(action.tx.value) });
+  await publicClient.waitForTransactionReceipt({ hash });
+  lastSent = { id: action.id, hash, tx: action.tx };
+  return api("POST", `/wallet/actions/${action.id}/confirm`, { txHash: hash });
 }
 
-const transferData = (to, amount) => encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [to, amount] });
+/** Simulates a DelegationManager call from `from` without changing anything. Returns why it was blocked, or throws if allowed. */
+async function expectBlocked(items, from = bot.address) {
+  try {
+    await publicClient.call({ account: from, to: MM.delegationManager, data: encodeRedeem(items) });
+  } catch (error) {
+    return describeRevert(error) ?? error.shortMessage?.split("\n")[0];
+  }
+  throw new Error("This went through. It should have been blocked.");
+}
+async function expectAllowed(items) {
+  await publicClient.call({ account: bot.address, to: MM.delegationManager, data: encodeRedeem(items) });
+}
 
-const swapData = (overrides) =>
-  encodeFunctionData({
-    abi: swapRouterAbi,
-    functionName: "exactInputSingle",
-    args: [
-      {
-        tokenIn: USDT.address,
-        tokenOut: DEOD.address,
-        fee: config.rules.poolFee,
-        recipient: wallet.safeAddress,
-        amountIn: parseUnits("10", USDT.decimals),
-        amountOutMinimum: 0n,
-        sqrtPriceLimitX96: 0n,
-        ...overrides,
-      },
-    ],
+const swapExec = (overrides) =>
+  createExecution({
+    target: ADDRESSES.swapRouter,
+    callData: encodeFunctionData({
+      abi: swapRouterAbi,
+      functionName: "exactInputSingle",
+      args: [
+        {
+          tokenIn: USDT.address,
+          tokenOut: DEOD.address,
+          fee: config.rules.poolFee,
+          recipient: account,
+          amountIn: parseUnits("1", 18),
+          amountOutMinimum: 0n,
+          sqrtPriceLimitX96: 0n,
+          ...overrides,
+        },
+      ],
+    }),
   });
+const transferExec = (tokenInfo, to, amount) =>
+  createExecution({ target: tokenInfo.address, callData: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [to, amount] }) });
+const approveExec = (tokenInfo, spender) =>
+  createExecution({ target: tokenInfo.address, callData: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [spender, maxUint256] }) });
+const bnbExec = (to, value, callData = "0x") => createExecution({ target: to, value, callData });
 
-let wallet;
+let account;
+let botDelegation;
+let ownerDelegation;
+let gasPaid = 0n;
 
-console.log(`Test user ${user.address}, bot ${bot.address}, fee collector ${feeCollector}, API ${API}\n`);
+/** Runs a test trade and checks the user's smart account paid its gas to the bot, in the same transaction. */
+async function tradeAndCheckGas(sell, amount) {
+  const [accountBefore, botBefore] = await Promise.all([bnbOf(account), bnbOf(bot.address)]);
+  const r = await api("POST", "/bot/test-trade", { sell, amount });
+  const receipt = await publicClient.getTransactionReceipt({ hash: r.txHash });
+  const botSpent = receipt.gasUsed * receipt.effectiveGasPrice;
+  const userPaid = accountBefore - (await bnbOf(account));
+  const botKept = (await bnbOf(bot.address)) - botBefore;
+  assert.ok(BigInt(r.amountOut) > 0n);
+  assert.equal(userPaid, BigInt(r.gasFee), "the smart account should pay exactly the gas fee the bot reported");
+  assert.equal(botKept, userPaid - botSpent);
+  assert.ok(botKept >= 0n, "the bot should be paid back at least the gas it spent");
+  gasPaid += userPaid;
+  const other = sell === "USDT" ? "DEOD" : "USDT";
+  return `got ${fmt(r.amountOut)} ${other}; user paid ${fmt(userPaid, 8)} ${BNB} for ${receipt.gasUsed} gas, bot spent ${fmt(botSpent, 8)} and was repaid in full`;
+}
+
+console.log(`Test user ${user.address}, bot ${bot.address}, API ${API}\n`);
 
 await step(`Backend is running on ${config.chain.name}`, async () => {
   const cfg = await api("GET", "/config");
@@ -144,206 +162,218 @@ await step("Sign in with Ethereum", async () => {
     version: "1",
     statement: "Sign in to userDexBot.",
   });
-  const signature = await user.signMessage({ message });
-  ({ token } = await api("POST", "/auth/verify", { message, signature }));
+  ({ token } = await api("POST", "/auth/verify", { message, signature: await user.signMessage({ message }) }));
   assert.ok(token);
 });
 
-await step("User creates the bot wallet from their own account and pays the gas", async () => {
+await step("User creates their MetaMask smart account, pays the gas, and signs the owner permission", async () => {
   const bnbBefore = await publicClient.getBalance({ address: user.address });
-  const { tx, safeAddress } = await api("POST", "/wallet/create-tx");
-  const hash = await userWallet.sendTransaction({ to: tx.to, data: tx.data });
+  const created = await api("POST", "/wallet/create-tx");
+  assert.equal(created.tx.to.toLowerCase(), MM.factory.toLowerCase());
+  const hash = await userWallet.sendTransaction({ to: created.tx.to, data: created.tx.data });
   await publicClient.waitForTransactionReceipt({ hash });
-  ({ wallet } = await api("POST", "/wallet"));
-  assert.equal(wallet.safeAddress, safeAddress);
-  const [owners, threshold] = await Promise.all([
-    publicClient.readContract({ address: wallet.safeAddress, abi: safeAbi, functionName: "getOwners" }),
-    publicClient.readContract({ address: wallet.safeAddress, abi: safeAbi, functionName: "getThreshold" }),
-  ]);
-  assert.deepEqual(owners, [user.address]);
-  assert.equal(threshold, 1n);
+  const signature = await user.signTypedData(revive(created.typedData));
+  ownerDelegation = { ...created.ownerDelegation, signature };
+  const { wallet } = await api("POST", "/wallet", { signature });
+  account = wallet.account;
+  assert.equal(account, created.account);
+  assert.equal(await accountOwner(account), user.address);
   assert.equal(wallet.botEnabled, false);
   const paid = bnbBefore - (await publicClient.getBalance({ address: user.address }));
   assert.ok(paid > 0n, "the user should have paid gas");
-  return `Safe ${wallet.safeAddress}, user paid ${fmt(paid)} BNB gas`;
+  return `account ${account}, user paid ${fmt(paid)} BNB gas`;
 });
 
-await step("Recording the wallet again returns the same wallet", async () => {
+await step("Recording the account again returns the same account", async () => {
   const again = await api("POST", "/wallet");
-  assert.equal(again.wallet.safeAddress, wallet.safeAddress);
+  assert.equal(again.wallet.account, account);
 });
 
-await step("User deposits 500 USDT and 5,000 DEOD", async () => {
+await step(`User deposits 500 USDT, 5,000 DEOD and 0.05 ${BNB} for gas`, async () => {
   for (const [tokenInfo, amount] of [[USDT, "500"], [DEOD, "5000"]]) {
     const hash = await userWallet.writeContract({
       address: tokenInfo.address,
       abi: erc20Abi,
       functionName: "transfer",
-      args: [wallet.safeAddress, parseUnits(amount, tokenInfo.decimals)],
+      args: [account, parseUnits(amount, tokenInfo.decimals)],
     });
     await publicClient.waitForTransactionReceipt({ hash });
   }
-  assert.equal(await balance(USDT, wallet.safeAddress), parseUnits("500", 18));
-  assert.equal(await balance(DEOD, wallet.safeAddress), parseUnits("5000", 18));
+  const hash = await userWallet.sendTransaction({ to: account, value: parseEther("0.05") });
+  await publicClient.waitForTransactionReceipt({ hash });
+  assert.equal(await balance(USDT, account), parseUnits("500", 18));
+  assert.equal(await bnbOf(account), parseEther("0.05"));
 });
 
-await step("The bot has no rules module to act through before the user enables it", async () => {
-  const code = await publicClient.getCode({ address: wallet.rolesAddress });
-  assert.ok(!code || code === "0x");
-});
-
-await step("A stranger cannot send the owner's wallet action", async () => {
-  const stranger = privateKeyToAccount(generatePrivateKey());
-  const action = await api("POST", "/wallet/actions", { kind: "enable-bot" });
-  const m = action.typedData.message;
+await step("A bot permission signed by a stranger is rejected", async () => {
+  const request = await api("POST", "/bot/permission");
+  const signature = await stranger.signTypedData(revive(request.typedData));
   try {
-    await publicClient.simulateContract({
-      account: stranger,
-      address: wallet.safeAddress,
-      abi: safeAbi,
-      functionName: "execTransaction",
-      args: [m.to, BigInt(m.value), m.data, Number(m.operation), 0n, 0n, 0n, zeroAddress, zeroAddress, ownerSentSignature(user.address)],
-    });
+    await api("POST", `/bot/permission/${request.id}`, { signature });
   } catch (error) {
-    return describeRevert(error) ?? error.shortMessage?.split("\n")[0];
+    return errorText(error);
   }
-  throw new Error("A stranger was able to act as the owner.");
+  throw new Error("A stranger's signature was accepted.");
 });
 
-await step("User enables the bot with one transaction and pays the gas", async () => {
-  await sendAction({ kind: "enable-bot" });
+await step("User enables the bot with one free signature, no transaction", async () => {
+  const bnbBefore = await publicClient.getBalance({ address: user.address });
+  const request = await api("POST", "/bot/permission");
+  const signature = await user.signTypedData(revive(request.typedData));
+  await api("POST", `/bot/permission/${request.id}`, { signature });
+  botDelegation = { ...request.delegation, signature };
   const me = await api("GET", "/me");
   assert.equal(me.wallet.botEnabled, true);
-  assert.equal(BigInt(me.wallet.feeRemainingToday), config.rules.dailyFeeCap);
+  assert.equal(BigInt(me.wallet.gasBudgetLeftToday), GAS_CAP);
+  assert.equal(await publicClient.getBalance({ address: user.address }), bnbBefore, "enabling should cost the user nothing");
+  lastSent = { id: request.id, signature };
 });
 
-await step("Confirming the same action twice is refused", async () => {
+await step("Submitting the same permission twice is refused", async () => {
+  try {
+    await api("POST", `/bot/permission/${lastSent.id}`, { signature: lastSent.signature });
+  } catch (error) {
+    return errorText(error);
+  }
+  throw new Error("The same permission was accepted twice.");
+});
+
+await step(`Bot buys DEOD with 20 USDT, and the user's ${BNB} pays the gas in the same transaction`, () => tradeAndCheckGas("USDT", "20"));
+
+await step(`Bot sells 1,000 DEOD for USDT, and the user's ${BNB} pays the gas`, () => tradeAndCheckGas("DEOD", "1000"));
+
+await step("Gas budget and daily limits went down by exactly what was used", async () => {
+  const me = await api("GET", "/me");
+  assert.equal(BigInt(me.wallet.gasBudgetLeftToday), GAS_CAP - gasPaid);
+  assert.equal(BigInt(me.wallet.remainingToday.USDT), dailyLimits.USDT - parseUnits("20", 18));
+  assert.equal(BigInt(me.wallet.remainingToday.DEOD), dailyLimits.DEOD - parseUnits("1000", 18));
+});
+
+await step("The bot's own per-trade limit refuses an oversized trade (MetaMask rules can't cap trade size)", async () => {
+  try {
+    await api("POST", "/bot/test-trade", { sell: "USDT", amount: formatUnits(perTradeLimits.USDT + 1n, 18) });
+  } catch (error) {
+    return errorText(error);
+  }
+  throw new Error("The bot accepted an oversized trade.");
+});
+
+console.log("\nAttacks with the bot key directly, all of which must be blocked on-chain:");
+
+await step(`Attack: send ${BNB} to anyone other than the bot`, () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.GAS), execution: bnbExec(stranger.address, 1n) }]),
+);
+
+await step(`Attack: take more ${BNB} than is left in today's gas budget`, async () => {
+  const left = GAS_CAP - gasPaid;
+  assert.ok((await bnbOf(account)) > left, "the account must hold more than the budget, so only the permission can block it");
+  await expectAllowed([{ delegation: withGroup(botDelegation, GROUP.GAS), execution: bnbExec(bot.address, left) }]);
+  const reason = await expectBlocked([{ delegation: withGroup(botDelegation, GROUP.GAS), execution: bnbExec(bot.address, left + 1n) }]);
+  return `the rest of the budget is allowed, 1 wei more: ${reason}`;
+});
+
+await step("Attack: use the gas rule to call a contract instead of a plain transfer", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.GAS), execution: bnbExec(bot.address, 1n, "0x12345678") }]),
+);
+
+await step("Attack: send USDT or DEOD anywhere", async () => {
+  const reasons = [];
+  for (const tokenInfo of [USDT, DEOD]) {
+    for (const group of [GROUP.GAS, GROUP.APPROVE]) {
+      reasons.push(await expectBlocked([{ delegation: withGroup(botDelegation, group), execution: transferExec(tokenInfo, bot.address, 1n) }]));
+    }
+  }
+  return [...new Set(reasons)].join(" / ");
+});
+
+await step("Attack: approve someone other than the router", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.APPROVE), execution: approveExec(USDT, stranger.address) }]),
+);
+
+await step("Attack: swap with the output sent elsewhere", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.SELL_USDT), execution: swapExec({ recipient: stranger.address }) }]),
+);
+
+await step("Attack: swap through a different pool fee tier", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.SELL_USDT), execution: swapExec({ fee: 2500 }) }]),
+);
+
+await step("Attack: swap into a token that is not DEOD", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.SELL_USDT), execution: swapExec({ tokenOut: UNLISTED_TOKEN }) }]),
+);
+
+await step("Attack: swap using the approval permission group", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.APPROVE), execution: swapExec({}) }]),
+);
+
+await step("Attack: bot uses the owner's own permission", () =>
+  expectBlocked([{ delegation: ownerDelegation, execution: transferExec(USDT, bot.address, 1n) }]),
+);
+
+await step("Attack: a stranger uses the bot's permission", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.GAS), execution: bnbExec(stranger.address, 1n) }], stranger.address),
+);
+
+console.log("\nUser controls:");
+
+await step("User withdraws all USDT back to MetaMask and pays the gas", async () => {
+  const before = await balance(USDT, user.address);
+  const inAccount = await balance(USDT, account);
+  await sendAction({ kind: "withdraw", token: "USDT", amount: "max" });
+  assert.equal(await balance(USDT, account), 0n);
+  assert.equal(await balance(USDT, user.address), before + inAccount);
+  return `${fmt(inAccount)} USDT`;
+});
+
+await step("Confirming the same wallet action twice is refused", async () => {
   try {
     await api("POST", `/wallet/actions/${lastSent.id}/confirm`, { txHash: lastSent.hash });
   } catch (error) {
-    return error.message.split(": ").slice(1).join(": ");
+    return errorText(error);
   }
   throw new Error("The same action was confirmed twice.");
 });
 
-await step(`Bot buys DEOD with 20 USDT and takes the ${fmt(FEE)} USDT network fee`, async () => {
-  const collectorBefore = await balance(USDT, feeCollector);
-  const r = await api("POST", "/bot/test-trade", { sell: "USDT", amount: "20" });
-  assert.ok(BigInt(r.amountOut) > 0n);
-  assert.equal((await balance(USDT, feeCollector)) - collectorBefore, FEE);
-  return `got ${fmt(r.amountOut)} DEOD`;
-});
-
-await step(`Bot sells 1,000 DEOD for USDT and takes the ${fmt(FEE)} USDT network fee`, async () => {
-  const collectorBefore = await balance(USDT, feeCollector);
-  const r = await api("POST", "/bot/test-trade", { sell: "DEOD", amount: "1000" });
-  assert.ok(BigInt(r.amountOut) > 0n);
-  assert.equal((await balance(USDT, feeCollector)) - collectorBefore, FEE);
-  return `got ${fmt(r.amountOut)} USDT`;
-});
-
-await step("Daily limits and fee budget went down by exactly what was used", async () => {
-  const me = await api("GET", "/me");
-  assert.equal(BigInt(me.wallet.remainingToday.USDT), config.rules.dailyLimits.USDT - parseUnits("20", 18));
-  assert.equal(BigInt(me.wallet.remainingToday.DEOD), config.rules.dailyLimits.DEOD - parseUnits("1000", 18));
-  assert.equal(BigInt(me.wallet.feeRemainingToday), config.rules.dailyFeeCap - 2n * FEE);
-});
-
-console.log("\nAttacks with the bot key, all of which must be blocked:");
-
-const stranger = privateKeyToAccount(generatePrivateKey()).address;
-
-await step("Attack: send USDT to anyone other than the fee collector", () =>
-  expectBlocked(wallet.rolesAddress, USDT.address, transferData(stranger, parseUnits("0.01", 18))),
-);
-
-await step("Attack: take more fee than is left in today's fee budget", async () => {
-  const left = config.rules.dailyFeeCap - 2n * FEE;
-  await simulateAsBot(wallet.rolesAddress, USDT.address, transferData(feeCollector, left));
-  const reason = await expectBlocked(wallet.rolesAddress, USDT.address, transferData(feeCollector, left + 1n));
-  return `the rest of the budget is allowed, one unit more is ${reason}`;
-});
-
-await step("Attack: send DEOD anywhere", () =>
-  expectBlocked(wallet.rolesAddress, DEOD.address, transferData(feeCollector, 1n)),
-);
-
-await step("Attack: approve someone else to spend USDT", () =>
-  expectBlocked(wallet.rolesAddress, USDT.address, encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [stranger, parseUnits("1", 18)] })),
-);
-
-await step("Attack: swap with the output sent elsewhere", () =>
-  expectBlocked(wallet.rolesAddress, ADDRESSES.swapRouter, swapData({ recipient: stranger })),
-);
-
-await step("Attack: swap through a different pool fee tier", () =>
-  expectBlocked(wallet.rolesAddress, ADDRESSES.swapRouter, swapData({ fee: 2500 })),
-);
-
-await step("Attack: swap into a token that is not DEOD or USDT", () =>
-  expectBlocked(wallet.rolesAddress, ADDRESSES.swapRouter, swapData({ tokenOut: UNLISTED_TOKEN })),
-);
-
-await step("Attack: sell 1 unit more than what is left of the daily USDT limit", async () => {
-  const remaining = config.rules.dailyLimits.USDT - parseUnits("20", 18);
-  // The wallet holds more USDT than the limit, so only the limit can be what stops this.
-  assert.ok((await balance(USDT, wallet.safeAddress)) > remaining + 1n);
-  await simulateAsBot(wallet.rolesAddress, ADDRESSES.swapRouter, swapData({ amountIn: remaining }));
-  const reason = await expectBlocked(wallet.rolesAddress, ADDRESSES.swapRouter, swapData({ amountIn: remaining + 1n }));
-  return `exactly the limit is allowed, one more is ${reason}`;
-});
-
-await step("Attack: bot calls the Safe directly as if it were a module", async () => {
+await step("A stranger cannot send the owner's withdrawal", async () => {
   try {
-    await publicClient.simulateContract({
-      account: bot,
-      address: wallet.safeAddress,
-      abi: [{ type: "function", name: "execTransactionFromModule", stateMutability: "nonpayable", inputs: [{ name: "to", type: "address" }, { name: "value", type: "uint256" }, { name: "data", type: "bytes" }, { name: "operation", type: "uint8" }], outputs: [{ type: "bool" }] }],
-      functionName: "execTransactionFromModule",
-      args: [USDT.address, 0n, transferData(bot.address, 1n), 0],
-    });
+    await publicClient.call({ account: stranger.address, to: lastSent.tx.to, data: lastSent.tx.data });
   } catch (error) {
-    return describeRevert(error) ?? error.shortMessage?.replace(/\s+/g, " ");
+    return describeRevert(error) ?? error.shortMessage?.split("\n")[0];
   }
-  throw new Error("The bot was able to do this. It should have been blocked.");
+  throw new Error("A stranger was able to use the owner's permission.");
 });
 
-console.log("\nUser controls:");
-
-await step("User withdraws all USDT back to their account and pays the gas", async () => {
-  const before = await balance(USDT, user.address);
-  const inWallet = await balance(USDT, wallet.safeAddress);
-  await sendAction({ kind: "withdraw", token: "USDT", amount: "max" });
-  assert.equal(await balance(USDT, wallet.safeAddress), 0n);
-  assert.equal(await balance(USDT, user.address), before + inWallet);
-  return `${fmt(inWallet)} USDT`;
+await step(`User withdraws all ${BNB} back to MetaMask`, async () => {
+  const inAccount = await bnbOf(account);
+  await sendAction({ kind: "withdraw", token: BNB, amount: "max" });
+  assert.equal(await bnbOf(account), 0n);
+  return `${fmt(inAccount, 6)} ${BNB}`;
 });
 
-await step("Bot refuses to sell DEOD when there is no USDT left for the fee", async () => {
+await step(`Bot refuses to trade when the account has no ${BNB} for gas`, async () => {
   try {
-    await api("POST", "/bot/test-trade", { sell: "DEOD", amount: "0.001" });
+    await api("POST", "/bot/test-trade", { sell: "DEOD", amount: "1" });
   } catch (error) {
-    return error.message.split(": ").slice(1).join(": ");
+    return errorText(error);
   }
-  throw new Error("The bot traded without being able to take its fee.");
+  throw new Error("The bot traded without the user paying its gas.");
 });
 
-await step("User stops the bot", async () => {
+await step("User stops the bot with one transaction", async () => {
   await sendAction({ kind: "stop-bot" });
   const me = await api("GET", "/me");
   assert.equal(me.wallet.botEnabled, false);
 });
 
-await step("Bot cannot trade after being stopped", async () => {
-  const reason = await expectBlocked(wallet.rolesAddress, ADDRESSES.swapRouter, swapData({ tokenIn: DEOD.address, tokenOut: USDT.address, amountIn: 1n }));
-  return reason;
-});
+await step("The bot's permission no longer works after being stopped", () =>
+  expectBlocked([{ delegation: withGroup(botDelegation, GROUP.SELL_DEOD), execution: swapExec({ tokenIn: DEOD.address, tokenOut: USDT.address, amountIn: 1n }) }]),
+);
 
-await step("User withdraws all DEOD back to their account", async () => {
-  const inWallet = await balance(DEOD, wallet.safeAddress);
+await step("User withdraws all DEOD after stopping the bot", async () => {
+  const inAccount = await balance(DEOD, account);
   await sendAction({ kind: "withdraw", token: "DEOD", amount: "max" });
-  assert.equal(await balance(DEOD, wallet.safeAddress), 0n);
-  return `${fmt(inWallet)} DEOD`;
+  assert.equal(await balance(DEOD, account), 0n);
+  return `${fmt(inAccount)} DEOD`;
 });
 
 const failed = results.filter((r) => !r.ok);

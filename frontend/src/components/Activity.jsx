@@ -1,4 +1,4 @@
-import { explorerLink, formatToken, timeAgo } from "../lib/format.js";
+import { explorerLink, formatAmount, formatToken, timeAgo } from "../lib/format.js";
 
 const STATUS_LABEL = {
   awaiting_signature: "Not signed",
@@ -12,7 +12,8 @@ const STATUS_LABEL = {
 function describeTrade(config, trade) {
   const sold = `${formatToken(config, trade.amountIn, trade.tokenIn)} ${trade.tokenIn}`;
   if (trade.status !== "success") return `Bot tried to sell ${sold}`;
-  return `Bot sold ${sold} for ${formatToken(config, trade.amountOut, trade.tokenOut)} ${trade.tokenOut}`;
+  const gas = trade.gasFee ? `, gas ${formatAmount(trade.gasFee, 18, 6)} ${config.nativeSymbol}` : "";
+  return `Bot sold ${sold} for ${formatToken(config, trade.amountOut, trade.tokenOut)} ${trade.tokenOut}${gas}`;
 }
 
 export default function Activity({ config, actions, trades }) {

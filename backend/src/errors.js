@@ -1,4 +1,4 @@
-import { Status } from "zodiac-roles-sdk";
+import { decodeRevertReason } from "@metamask/smart-accounts-kit/utils";
 
 export class HttpError extends Error {
   constructor(status, message) {
@@ -7,27 +7,31 @@ export class HttpError extends Error {
   }
 }
 
-// Safe reports failures as short codes. These are the ones users can run into.
-const SAFE_ERRORS = {
-  GS013: "The wallet transaction failed.",
-  GS025: "Only the wallet owner can send this.",
-  GS026: "The signature is not from the wallet owner.",
-  GS104: "The bot is not enabled on this wallet.",
+// Reasons MetaMask's permission contracts (caveat enforcers) and PancakeSwap give, in plain words.
+const REASONS = {
+  "NonceEnforcer:invalid-nonce": "The bot is stopped for this account.",
+  "NativeTokenPeriodTransferEnforcer:transfer-amount-exceeded": "Blocked by the permission: today's gas budget is used up.",
+  "ExactCalldataEnforcer:invalid-calldata": "Blocked by the permission: the gas repayment can only be a plain BNB transfer.",
+  "AllowedCalldataEnforcer:invalid-calldata": "Blocked by the permission: the transaction details are not what the user allowed.",
+  "AllowedTargetsEnforcer:target-address-not-allowed": "Blocked by the permission: that contract is not allowed.",
+  "AllowedMethodsEnforcer:method-not-allowed": "Blocked by the permission: that function is not allowed.",
+  "ValueLteEnforcer:value-too-high": "Blocked by the permission: sending BNB is not allowed.",
+  InvalidDelegate: "Blocked: only the holder of this permission can use it.",
+  InvalidDelegator: "Blocked: the permission is not for this account.",
+  CannotUseADisabledDelegation: "Blocked: this permission was switched off.",
+  STF: "The account does not hold enough of the token, or the token is not approved.",
+  "Too little received": "The price moved more than the allowed slippage.",
 };
 
 /** Explains why the blockchain rejected a call, or returns null if it wasn't a contract revert. */
 export function describeRevert(error) {
-  const revert = error?.walk?.((e) => e?.data?.errorName);
-  const data = revert?.data;
-  if (!data?.errorName) return null;
-  if (data.errorName === "ConditionViolation") {
-    return `Blocked by the wallet's rules: ${Status[Number(data.args?.[0])] ?? data.args?.[0]}`;
-  }
-  if (data.errorName === "Error" && SAFE_ERRORS[data.args?.[0]]) {
-    return `${SAFE_ERRORS[data.args[0]]} (${data.args[0]})`;
-  }
-  const args = data.args?.length ? `(${data.args.map(String).join(", ")})` : "";
-  return `Blocked by contract: ${data.errorName}${args}`;
+  const decoded = decodeRevertReason(error);
+  const reason = decoded?.message || decoded?.errorName;
+  if (reason) return REASONS[reason] ?? REASONS[decoded.errorName] ?? `Blocked: ${reason}`;
+  const viemRevert = error?.walk?.((e) => e?.data?.errorName || e?.reason);
+  const name = viemRevert?.data?.errorName === "Error" ? viemRevert.data.args?.[0] : viemRevert?.data?.errorName ?? viemRevert?.reason;
+  if (name) return REASONS[name] ?? `Blocked: ${name}`;
+  return null;
 }
 
 /** True when the blockchain node could not be reached at all, for example because anvil isn't running. */

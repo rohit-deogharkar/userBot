@@ -1,44 +1,56 @@
 # userDexBot
 
-An automated trading bot for **DEOD/USDT on BNB Chain**. Trades go through the DEOD/USDT pool on PancakeSwap v3.
+An automated trading bot for **DEOD/USDT on BNB Chain**, built on **MetaMask Smart Accounts**. Trades go through the DEOD/USDT pool on PancakeSwap v3.
 
 - **Users never hand over their private key.** It stays in MetaMask.
 - **Nobody can take user funds,** not the bot, our servers or our team. The blockchain enforces it.
-- **Users pay all gas,** including the gas for the bot's trades.
+- **Users pay all gas,** including the gas for the bot's trades, in BNB from their smart account.
 - **The bot keeps trading when the user logs out,** until the user stops it.
 
 ## How it works
 
-Each user gets a **bot wallet**: a [Safe](https://safe.global) smart wallet whose only owner is their MetaMask. The bot gets a **trade-only permission** through a [Zodiac Roles](https://docs.roles.gnosisguild.org) module attached to that wallet. The blockchain checks every bot transaction against the rules.
+Each user gets a **MetaMask smart account** (a Hybrid DeleGator from MetaMask's Smart Accounts Kit) whose only owner is their MetaMask. It holds only the funds they deposit for trading. The user signs the bot a **delegation**: a MetaMask permission with rules (caveats) that the blockchain checks on every bot transaction.
 
 ```
-User's MetaMask ──owns──▶ Bot wallet (Safe) ◀──trade-only key── Our bot server
-  create, deposit,          holds trading funds,     runs the strategy,
-  enable, stop, withdraw    enforces the rules       holds no user keys
+User's MetaMask ──owns──▶ MetaMask smart account ◀──signed permission── Our bot server
+  create, deposit,          holds trading funds,        runs the strategy,
+  enable, stop, withdraw    rules checked on-chain      holds no user keys
 ```
 
-The bot runs on the server, not in the browser. Whether the user is logged in makes no difference. It only stops when the user sends "Stop bot" from MetaMask, which switches the rules module off on-chain.
-
-## Who pays gas
-
-| Action | Sent by | Paid by |
+| User action | What MetaMask asks for | Gas |
 |---|---|---|
-| Create bot wallet, deposit, enable bot, stop bot, withdraw | The user, from MetaMask | The user, in BNB |
-| Each bot trade | The bot key | The user: the bot takes a flat USDT fee per trade from the bot wallet |
+| Create smart account | One transaction, plus one free signature (the owner permission) | User pays |
+| Deposit | One transfer: DEOD or USDT to trade, or a little BNB for the bot's gas | User pays |
+| Enable bot | One free signature (the bot's permission). No transaction. | None |
+| Stop bot | One transaction. It bumps the account's nonce, which cancels every bot permission at once. | User pays |
+| Withdraw | One transaction, through the owner permission | User pays |
 
-The per-trade fee repays the bot's gas. It defaults to 0.02 USDT, and the on-chain rules cap it at 1 USDT per day, so the bot can never take more. Both are settings. Trade gas on BNB Chain is about one cent.
+The bot runs on the server, not in the browser, so it keeps trading while the user is logged out. It stops only when the user sends "Stop bot".
 
 ## What the bot can and cannot do
 
-The rules live in [backend/src/permissions.js](backend/src/permissions.js) and are written on-chain when the user enables the bot.
+The rules live in [backend/src/metamask.js](backend/src/metamask.js). The user signs them once as a single permission with four rule groups, and each bot transaction picks the group it needs.
+
+**Enforced on-chain by the signed permission:**
 
 | The bot can | The bot can never |
 |---|---|
-| Swap DEOD and USDT on PancakeSwap v3, in the 1% DEOD/USDT pool only | Withdraw or transfer funds, apart from the capped fee |
-| Send swap output back to the bot wallet only | Trade other tokens, pools or exchanges |
-| Approve DEOD and USDT for the PancakeSwap router only | Change the rules, add modules or change the owner |
-| Sell up to a daily limit per token | Act at all after the user stops it |
-| Take the per-trade fee in USDT, up to the daily fee cap | |
+| Swap DEOD and USDT on PancakeSwap v3, in the 1% DEOD/USDT pool only | Withdraw or transfer funds, apart from the capped gas repayment |
+| Send swap output back to the smart account only | Trade other tokens, pools or exchanges |
+| Approve DEOD and USDT for the PancakeSwap router only | Approve anyone else |
+| Repay its own gas in BNB, sent only to the bot's address, up to the daily gas cap | Keep trading after the user stops it |
+
+**Enforced by the bot's own code, not on-chain:** the per-trade limit and daily sell limit. MetaMask's permission rules can't cap swap sizes: its balance-change rule reverts whenever an account holds less than the cap. A stolen or misused bot key therefore can't withdraw funds. It could make bad trades inside the pinned pool, and take up to the daily gas cap in BNB from each account. Keep the bot key in KMS and deposits modest.
+
+## Who pays gas
+
+Users pay for their own transactions in BNB from MetaMask. They also pay for the bot's trades, from BNB they deposit into their smart account next to their DEOD and USDT.
+
+On BNB Chain, whoever sends a transaction pays its gas. The bot sends the trades while the user is offline, so it pays the gas first. **In the same transaction as the swap**, the smart account pays the bot back in BNB: the trade's gas estimate times the gas price the transaction pays. A trade can't happen without its repayment. The bot therefore needs only a small float of BNB to send trades, which each trade refills.
+
+A trade uses about 1.2 to 1.7 million gas: about 0.0001 BNB at BNB Chain's usual 0.05 gwei, or 0.0002 test BNB on testnet. The signed permission caps what the bot can take at `DAILY_GAS_CAP_BNB` per day (default 0.005 BNB), and only to the bot's own address. If the smart account has no BNB, the bot doesn't trade.
+
+The platform charges nothing on top of gas. A platform fee would be a separate rule in the permission.
 
 ## Keys
 
@@ -49,50 +61,52 @@ The rules live in [backend/src/permissions.js](backend/src/permissions.js) and a
 | Bot key, development | `BOT_PRIVATE_KEY` in `.env` | Whoever has the file. Use only for local and testnet testing. |
 | Deployer key | `DEPLOYER_PRIVATE_KEY` in `.env.testnet` | Testnet setup scripts only. The running app never uses it. |
 
-To use KMS, create a key with key spec `ECC_SECG_P256K1` and usage `SIGN_VERIFY`. Give the server's IAM role only `kms:Sign` and `kms:GetPublicKey` on it. Then set `BOT_KMS_KEY_ID` and `AWS_REGION`, and remove `BOT_PRIVATE_KEY`. Even with a leaked or misused bot key, the rules above still apply.
+To use KMS, create a key with key spec `ECC_SECG_P256K1` and usage `SIGN_VERIFY`, give the server's IAM role only `kms:Sign` and `kms:GetPublicKey`, set `BOT_KMS_KEY_ID` and `AWS_REGION`, and remove `BOT_PRIVATE_KEY`. `npm run test:kms` checks the KMS signer without an AWS account.
 
-`npm run test:kms` checks the KMS signer without an AWS account. A stand-in behaves like KMS, and the test confirms messages and transactions verify and that a real node accepts them.
+## The browser's safety check
+
+Before MetaMask opens, [frontend/src/lib/verifyMetaMask.js](frontend/src/lib/verifyMetaMask.js) rebuilds each item from MetaMask's own contract registry and hard-coded token addresses, not from the backend:
+
+- **Smart account creation:** must match the standard MetaMask smart account owned only by the user.
+- **Owner permission:** must match exactly.
+- **Bot permission:** must match exactly, apart from the daily gas cap. That is read from the permission itself and shown to the user. Gas repayments must go to the bot's own address.
+- **Stop and withdraw:** must use the user's own permission, and withdrawals must go only to their MetaMask.
 
 ## Project layout
 
 ```
 backend/    Node.js + Express API and the bot
-  src/config.js        Networks, trading pair, contract addresses, rules and fees
-  src/safe.js          Bot wallet transactions and on-chain confirmation
-  src/roles.js         The "enable bot" and "stop bot" transactions
-  src/permissions.js   The trade-only rules
-  src/bot.js           Quotes, swaps and the per-trade fee
+  src/config.js        Networks, trading pair, contract addresses, limits and the gas cap
+  src/metamask.js      Smart accounts, the owner and bot permissions, and transaction encoding
+  src/bot.js           Quotes, swaps and the gas repayment, as one transaction
+  src/wallets.js       Account creation, enable, stop, withdraw and trades
   src/kms.js           Bot key signer backed by AWS KMS
   src/db.js            MongoDB: users, walletActions, trades, loginNonces
   src/strategy/        Where the trading strategy plugs in (currently empty)
   scripts/e2e.js       End-to-end proof, including theft attempts
   scripts/fund.js      Gives a test address USDT and DEOD (and BNB on local nodes)
   scripts/testnet-setup.js  One-time setup of BNB testnet
-  scripts/test-kms.js  KMS signer test
   testnet/             Test USDT contract and the saved testnet addresses
 frontend/   React (Vite) app
-  src/lib/verifySafeTx.js  Checks every wallet transaction before MetaMask opens
+  src/lib/verifyMetaMask.js  Checks everything before MetaMask opens
 ```
 
 ## Test on BNB testnet
 
-This uses the real public BNB testnet and your real MetaMask. BNB testnet is missing three things the bot needs, so a one-time setup creates them:
+MetaMask's Smart Accounts contracts already exist on BNB testnet. A one-time setup creates what's missing: a test USDT anyone can mint, and a DEOD/USDT pool on PancakeSwap v3 testnet at the 1% fee tier with test liquidity. Test DEOD is `0x3fb98B9DaebFdaA06b72Df9704aDe353500e7CFf`.
 
-- **Zodiac Roles 2.1.1,** copied byte for byte from BNB Chain.
-- **A test USDT** that anyone can mint.
-- **A DEOD/USDT pool** on PancakeSwap v3 testnet at the 1% fee tier, priced at about 0.02 USDT per DEOD. Test DEOD is `0x3fb98B9DaebFdaA06b72Df9704aDe353500e7CFf`.
+**To test from the browser,** run `npm run testnet` in the project folder. It starts the server and the website together. When it prints "Ready", open http://localhost:5173 with MetaMask on BNB Smart Chain Testnet. Keep the window open, and press Ctrl+C to stop both.
 
-Steps, all run in `backend`:
+One-time steps, in `backend`, only when needed:
 
-1. **Fund the deployer.** In MetaMask on BNB Smart Chain Testnet, send 0.1 test BNB to the deployer address. `npm run testnet:setup` prints it if it's empty. The setup costs about 0.03 test BNB, including 0.02 it gives the bot key for trade gas.
-2. **Run the setup once:** `npm run testnet:setup`. It's safe to run again.
-3. **Start the backend on testnet:** `npm run dev:testnet`. Stop any other backend on port 4000 first.
-4. **Get test USDT:** `npm run fund:testnet -- 0xYourMetaMaskAddress`
-5. **Open http://localhost:5173** with MetaMask on BNB Smart Chain Testnet. Import the test USDT address from `backend/testnet/deployment.json` to see it in MetaMask.
+1. **Fund the deployer and run the setup once.** Skip this if `backend/testnet/deployment.json` already lists a `usdt` and a `pool`. Send about 0.1 test BNB to the deployer address that the setup prints, then run `npm run testnet:setup`.
+2. **Get test USDT,** only to test with USDT: `npm run fund:testnet -- 0xYourMetaMaskAddress`
+
+In the website, after creating the smart account, deposit some DEOD or USDT plus about 0.01 test BNB for the bot's gas. The bot key needs its own small float of test BNB to send trades. The setup gives it 0.02, and each trade pays it back.
 
 ## Run on a local copy of BNB Chain
 
-This uses the real mainnet contracts with fake money, and needs Foundry's `anvil`. On Windows, unzip the `foundry_stable_win32_amd64.zip` release from [Foundry's GitHub releases](https://github.com/foundry-rs/foundry/releases).
+This uses the real mainnet contracts with fake money, and needs Foundry's `anvil`.
 
 1. `anvil --fork-url https://bsc-mainnet.public.blastapi.io --chain-id 561337`. The fork URL must serve historical state, and Blast API and `https://api.zan.top/bsc-mainnet` do.
 2. In `backend`: `npm install`, copy `.env.example` to `.env`, set `JWT_SECRET`, then `npm run dev`.
@@ -102,27 +116,35 @@ This uses the real mainnet contracts with fake money, and needs Foundry's `anvil
 
 ## What the proof checks
 
-`npm run e2e` runs on a local anvil node. It plays a user through the real API, with the user sending and paying for every wallet transaction, then attacks the wallet with the bot key:
+`npm run e2e` runs on a local anvil node, against a copy of BNB Chain or of BNB testnet. It plays a user through the real API, with the user sending and paying for every transaction, then attacks with the bot key:
 
-- **The user's side.** Create the wallet, deposit and enable the bot, all from the user's own account.
-- **Stranger blocked.** A stranger cannot send the owner's wallet actions.
-- **Trades and fees.** Two trades, each taking exactly the per-trade fee. Daily limits and the fee budget go down by exactly what was used.
-- **Theft attempts blocked.** The bot key can't send USDT to anyone but the fee collector, or exceed the fee cap by one unit. It can't send DEOD at all, approve others, redirect swap output, use another pool or token, exceed a trading limit, or call the wallet directly.
-- **No free trades.** The bot won't trade when it can't collect its fee.
-- **The user stays in control.** The user withdraws everything and stops the bot, after which the bot can't trade.
+- **Setup.** The user creates the smart account, signs the owner permission, deposits DEOD, USDT and BNB, and enables the bot with one free signature. A stranger's signature and a reused permission are both refused.
+- **Trades and gas.** Two trades. In each, the user's BNB repays the bot's gas in the same transaction, and the bot ends up repaid in full. The gas budget and daily limits go down by exactly what was used.
+- **Theft attempts blocked on-chain.** The bot key can't:
+  - send BNB anywhere but its own address, go 1 wei over the daily gas cap, or attach call data to the repayment;
+  - send USDT or DEOD at all;
+  - approve anyone but the router;
+  - redirect swap output, or use another pool or token;
+  - use the owner's permission.
+  A stranger can't use the bot's permission or the owner's withdrawal.
+- **No unpaid trades.** After the user withdraws their BNB, the bot refuses to trade.
+- **User control.** The user withdraws everything and stops the bot, after which the bot's permission no longer works.
+
+On a local copy of BNB Chain, the development bot key is anvil's public test key. Someone has attached a sweeper contract to its address on the real chain (EIP-7702), which would forward away gas repayments. Test funding clears it on local copies, and the backend warns at startup if the bot's address has any contract attached.
 
 ## Configuration
 
-Settings are in `backend/.env` for the local copy and `backend/.env.testnet` for testnet. The example files describe each one.
+Settings are in `backend/.env` for the local copy and `backend/.env.testnet` for testnet.
 
 | Variable | Purpose |
 |---|---|
 | `NETWORK` | `bsc-fork`, `bsc-testnet` or `bsc` |
 | `MONGODB_URI`, `MONGODB_DB` | MongoDB connection. The database defaults to `userdexbot_<network>`. |
-| `BOT_KMS_KEY_ID` or `BOT_PRIVATE_KEY` | The bot's trade-only key. Use KMS in production. |
+| `BOT_KMS_KEY_ID` or `BOT_PRIVATE_KEY` | The bot's key. Use KMS in production. |
 | `DEPLOYER_PRIVATE_KEY` | Testnet setup and test funding only |
-| `TRADE_FEE_USDT`, `DAILY_FEE_CAP_USDT`, `FEE_COLLECTOR` | Per-trade fee, its daily cap, and where fees go. By default fees go to the bot's address. |
-| `POOL_FEE`, `DAILY_LIMIT_DEOD`, `DAILY_LIMIT_USDT`, `SLIPPAGE_BPS` | Trading rules and limits |
+| `DAILY_GAS_CAP_BNB` | The most BNB the bot may take per day from a smart account to repay its gas. Enforced on-chain by the permission. |
+| `PER_TRADE_LIMIT_DEOD`, `PER_TRADE_LIMIT_USDT`, `DAILY_LIMIT_DEOD`, `DAILY_LIMIT_USDT` | Trade size limits, checked by the bot |
+| `POOL_FEE`, `SLIPPAGE_BPS` | Pool fee tier and maximum slippage |
 | `ENABLE_TEST_TRADES` | Shows a manual "test trade" button. Turn off in production. |
 | `STRATEGY_ENABLED`, `STRATEGY_INTERVAL_MS` | Automatic strategy loop |
 
@@ -130,12 +152,14 @@ Settings are in `backend/.env` for the local copy and `backend/.env.testnet` for
 
 | Method and path | What it does |
 |---|---|
-| `GET /api/config` | Network, tokens, bot address, rules and fees |
+| `GET /api/config` | Network, tokens, bot address, rules, limits and the gas cap |
 | `GET /api/auth/nonce`, `POST /api/auth/verify` | Sign-In with Ethereum |
-| `GET /api/me` | Balances, bot status, limits and fee budget left, recent activity |
-| `POST /api/wallet/create-tx` | The transaction the user sends to create their bot wallet |
-| `POST /api/wallet` | Records the bot wallet once it exists on-chain |
-| `POST /api/wallet/actions` | Builds an enable, stop or withdraw transaction for the user to send |
+| `GET /api/me` | Balances, bot status, limits and gas budget left, recent activity |
+| `POST /api/wallet/create-tx` | The smart account creation transaction and the owner permission to sign |
+| `POST /api/wallet` | Records the smart account with the signed owner permission |
+| `POST /api/bot/permission` | The bot permission for the user to sign |
+| `POST /api/bot/permission/:id` | Stores the signed bot permission after checking it on-chain |
+| `POST /api/wallet/actions` | Builds a stop or withdraw transaction for the user to send |
 | `POST /api/wallet/actions/:id/confirm` | Checks the user's transaction on-chain and records it |
 | `POST /api/bot/test-trade` | Makes one swap now. Development only. |
 
@@ -145,19 +169,21 @@ Write it in [backend/src/strategy/strategy.js](backend/src/strategy/strategy.js)
 
 ## Before going to production
 
-1. **Bot key in KMS.** Set `BOT_KMS_KEY_ID` and remove `BOT_PRIVATE_KEY`. Keep a small BNB balance on the bot address for trade gas and alert when it runs low. The fees it collects in USDT repay that gas.
-2. **Rule check in the browser.** The frontend checks wallet creation, withdraw and stop exactly. For "enable bot" it checks which contracts and functions the rules cover, but not each rule's conditions. Rebuild the expected rules in the browser and compare them exactly.
-3. **Frontend hosting.** Host the frontend separately from the API with locked-down deployments.
-4. **Sessions.** Move the login token from browser storage to an httpOnly cookie.
-5. **Database.** Use a managed MongoDB deployment with authentication, TLS and backups.
-6. **Outside review.** Get the rules and the integration reviewed by a smart-contract auditor.
-7. **Legal review.** Confirm obligations for an automated trading service in your market.
-8. **Thin liquidity.** The DEOD/USDT pool held about $69,000 when this was built. Keep daily limits small.
+1. **Test with the real MetaMask extension.** The automated browser test used a stand-in that signs like MetaMask. Check how MetaMask displays the permission signature requests, and that it doesn't block or warn on them.
+2. **Bot key in KMS.** Set `BOT_KMS_KEY_ID` and remove `BOT_PRIVATE_KEY`. Keep a small BNB balance on the bot address, and alert when it runs low.
+3. **Trade size limits.** They aren't enforced on-chain, so keep daily limits and deposits modest. An on-chain volume cap would need a custom caveat enforcer contract, which would need an audit.
+4. **Frontend hosting.** Host the frontend separately from the API with locked-down deployments.
+5. **Sessions.** Move the login token from browser storage to an httpOnly cookie.
+6. **Database.** Use a managed MongoDB deployment with authentication, TLS and backups.
+7. **Outside review.** Get the permission rules and the integration reviewed by a smart-contract auditor.
+8. **Legal review.** Confirm obligations for an automated trading service in your market.
 9. **Launch settings.** Set `NETWORK=bsc`, use a paid RPC provider, and turn off test trades.
 
 ## Known limitations
 
-- Only DEOD and USDT, one PancakeSwap v3 pool, and one set of limits and fees for every user.
-- BNB sent to a bot wallet can be withdrawn but is not traded.
-- The fee is paid in USDT. Sales of DEOD pay it from their proceeds, so a sale worth less than the fee is refused.
+- Only DEOD and USDT, one PancakeSwap v3 pool, and one set of limits and one gas cap for every user.
+- BNB in a smart account pays the bot's gas and can be withdrawn, but is never traded.
+- The gas repayment is based on the transaction's gas estimate, which runs slightly above the gas actually used (about 0.3% in testing).
 - Users can lose money through bad trades. The rules stop theft, not losses.
+
+The earlier Safe and Zodiac Roles version, which also enforced trading limits on-chain, is in the git history.

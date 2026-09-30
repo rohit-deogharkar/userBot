@@ -11,7 +11,7 @@ async function tick() {
   if (running) return; // Skip a tick if the previous one is still going.
   running = true;
   try {
-    for (const user of await users.withWallet()) {
+    for (const user of await users.withBotPermission()) {
       const owner = getAddress(user.address);
       try {
         const wallet = await getWalletInfo(user);

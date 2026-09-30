@@ -9,6 +9,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@metamask/delegation-abis": "^2.0.0",
+    "@metamask/delegation-core": "^3.0.0",
+    "@metamask/delegation-deployments": "^2.0.0",
+    "@metamask/smart-accounts-kit": "^2.0.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "viem": "^2.56.9"

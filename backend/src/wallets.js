@@ -1,24 +1,32 @@
 import { randomUUID } from "node:crypto";
-import { encodeFunctionData, formatUnits, getAddress, parseUnits } from "viem";
+import { formatUnits, getAddress, parseUnits } from "viem";
 import { erc20Abi } from "./abis.js";
 import { executeSwap } from "./bot.js";
-import { publicClient } from "./chain.js";
+import { botAccount, publicClient } from "./chain.js";
 import { TOKENS, config, otherToken } from "./config.js";
 import { toJson, trades, users, walletActions } from "./db.js";
 import { HttpError, describeError } from "./errors.js";
-import { buildEnableBotCalls, buildStopBotCall, getRolesState, predictRolesAddress } from "./roles.js";
 import {
-  assertSafeOwnedOnlyBy,
-  buildCreateSafeTx,
-  buildSafeTx,
-  confirmSafeTx,
-  encodeMultiSend,
+  MM,
+  accountOwner,
+  buildBotDelegation,
+  buildCreateAccountTx,
+  buildOwnerDelegation,
+  delegationHash,
+  delegationTypedData,
+  gasBudgetLeftToday,
+  isBotDelegationLive,
   isDeployed,
-  predictSafeAddress,
-  safeTxTypedData,
-} from "./safe.js";
+  isValidDelegationSignature,
+  ownerActionTx,
+  predictAccount,
+  sameAddress,
+  stopBotExecution,
+  withdrawExecution,
+} from "./metamask.js";
 
 const short = (address) => `${address.slice(0, 6)}…${address.slice(-4)}`;
+const asJson = (value) => JSON.parse(toJson(value));
 
 /** Balances of the trading pair tokens plus the chain's native coin (BNB), keyed by symbol. */
 export async function getBalances(address) {
@@ -31,69 +39,118 @@ export async function getBalances(address) {
 }
 
 export async function getWalletInfo(user) {
-  if (!user?.safeAddress) return null;
-  const safe = getAddress(user.safeAddress);
-  // A restarted local fork forgets wallets the database still remembers. Treat those as not created yet;
+  if (!user?.account || !user?.ownerDelegation) return null;
+  const account = getAddress(user.account);
+  // A restarted local fork forgets accounts the database still remembers. Treat those as not created yet;
   // creating again redeploys them at the same address.
-  if (!(await isDeployed(safe))) return null;
-  const [balances, rolesState] = await Promise.all([
-    getBalances(safe),
-    getRolesState(safe, user.rolesAddress && getAddress(user.rolesAddress)),
+  if (!(await isDeployed(account))) return null;
+
+  const botDelegation = user.botDelegation?.delegation ?? null;
+  const [balances, botEnabled] = await Promise.all([
+    getBalances(account),
+    botDelegation ? isBotDelegationLive(account, botDelegation) : false,
   ]);
+  const remainingToday = {};
+  for (const symbol of Object.keys(TOKENS)) {
+    const sold = await trades.soldInLastDay(user.address, symbol);
+    const limit = config.rules.dailyLimits[symbol];
+    remainingToday[symbol] = sold >= limit ? 0n : limit - sold;
+  }
   return {
-    safeAddress: safe,
-    rolesAddress: user.rolesAddress ? getAddress(user.rolesAddress) : null,
-    botEnabled: rolesState.botEnabled,
+    account,
+    botEnabled,
     balances,
-    remainingToday: rolesState.remainingToday,
-    feeRemainingToday: rolesState.feeRemainingToday,
+    remainingToday,
+    perTradeLimits: config.rules.perTradeLimits,
+    gasBudgetLeftToday: botEnabled ? await gasBudgetLeftToday(botDelegation) : 0n,
   };
 }
 
-/** The MetaMask transaction that creates the user's bot wallet. The user sends it and pays the gas. */
-export async function prepareCreateWallet(owner) {
-  return buildCreateSafeTx(owner);
-}
-
 /**
- * Records the user's bot wallet once it exists on the blockchain.
- * The Roles module address is known in advance; the module itself is created when the user first enables the bot.
+ * Step 1 of creating the smart account: the MetaMask transaction that deploys it, plus the owner
+ * delegation the user signs so they can later withdraw and stop the bot from MetaMask.
  */
-export async function syncBotWallet(owner) {
-  const safe = await predictSafeAddress(owner);
-  if (!(await isDeployed(safe))) {
-    throw new HttpError(400, "Your bot wallet is not on the blockchain yet. Confirm the MetaMask transaction first.");
-  }
-  await assertSafeOwnedOnlyBy(safe, owner);
-  return users.upsertWallet(owner, safe, predictRolesAddress(safe));
+export async function prepareCreateWallet(owner) {
+  const { account, tx } = await buildCreateAccountTx(owner);
+  const ownerDelegation = buildOwnerDelegation(owner, account);
+  return asJson({ account, tx, ownerDelegation, typedData: delegationTypedData(ownerDelegation) });
 }
 
-async function requireWallet(owner) {
-  const user = await users.get(owner);
-  if (!user?.safeAddress || !user?.rolesAddress || !(await isDeployed(getAddress(user.safeAddress)))) {
-    throw new HttpError(400, "Create your bot wallet first.");
+/** Step 2: once the account exists, check the owner delegation's signature on-chain and record both. */
+export async function syncBotWallet(owner, signature) {
+  const { address: account } = await predictAccount(owner);
+  if (!(await isDeployed(account))) {
+    throw new HttpError(400, "Your smart account is not on the blockchain yet. Confirm the MetaMask transaction first.");
   }
-  return { user, safe: getAddress(user.safeAddress), roles: getAddress(user.rolesAddress) };
+  if (!sameAddress(await accountOwner(account), owner)) throw new HttpError(400, "That smart account has a different owner.");
+
+  const existing = await users.get(owner);
+  if (!signature) {
+    if (existing?.ownerDelegation && sameAddress(existing.account, account)) return existing;
+    throw new HttpError(400, "Sign the owner permission in MetaMask to finish setting up your smart account.");
+  }
+  const ownerDelegation = buildOwnerDelegation(owner, account);
+  if (!(await isValidDelegationSignature(ownerDelegation, signature))) {
+    throw new HttpError(400, "That signature is not from the smart account's owner.");
+  }
+  return users.saveAccount(owner, account, { ...ownerDelegation, signature });
+}
+
+async function requireAccount(owner) {
+  const user = await users.get(owner);
+  if (!user?.account || !user?.ownerDelegation || !(await isDeployed(getAddress(user.account)))) {
+    throw new HttpError(400, "Create your smart account first.");
+  }
+  return { user, account: getAddress(user.account) };
+}
+
+/** Builds the bot's trade-only permission for the user to sign once in MetaMask. Signing is free. */
+export async function prepareEnableBot(owner) {
+  const { user, account } = await requireAccount(owner);
+  const info = await getWalletInfo(user);
+  if (info.botEnabled) throw new HttpError(400, "The bot is already enabled.");
+  const delegation = await buildBotDelegation(account, botAccount.address);
+  const id = randomUUID();
+  const summary = "Give the bot its trade-only permission";
+  await walletActions.create({ id, owner, account, kind: "enable-bot", summary, delegation: asJson(delegation) });
+  return asJson({ id, kind: "enable-bot", summary, delegation, typedData: delegationTypedData(delegation) });
+}
+
+/** Stores the signed bot permission after the smart account itself confirms the signature is valid. */
+export async function confirmEnableBot(owner, id, signature) {
+  const action = await walletActions.claimForConfirm(id, owner);
+  if (!action || action.kind !== "enable-bot") {
+    const existing = await walletActions.find(id, owner);
+    if (!existing) throw new HttpError(404, "Permission request not found.");
+    throw new HttpError(400, `This request is already ${existing.status}.`);
+  }
+  try {
+    if (!(await isValidDelegationSignature(action.delegation, signature))) {
+      throw new HttpError(400, "That signature is not from the smart account's owner.");
+    }
+    const signed = { ...action.delegation, signature };
+    await users.setBotDelegation(owner, { delegation: signed, hash: delegationHash(signed), createdAt: new Date() });
+    await walletActions.finish(id, "executed");
+    return { ok: true };
+  } catch (error) {
+    await walletActions.finish(id, "failed", { error: describeError(error).message });
+    throw error;
+  }
 }
 
 /**
- * Builds a wallet action for the user to send from MetaMask. The user pays its gas.
- * The browser checks the contents before MetaMask opens, and the Safe only accepts it from the owner.
+ * Builds a transaction the user sends from MetaMask through their owner delegation. The user pays its gas.
+ * The browser checks its contents before MetaMask opens.
  */
 export async function prepareWalletAction(owner, { kind, token, amount }) {
-  const { user, safe, roles } = await requireWallet(owner);
+  const { user, account } = await requireAccount(owner);
   const info = await getWalletInfo(user);
-  let call;
+  let execution;
   let summary;
 
-  if (kind === "enable-bot") {
-    if (info.botEnabled) throw new HttpError(400, "The bot is already enabled.");
-    call = encodeMultiSend(await buildEnableBotCalls(safe, roles));
-    summary = "Enable the bot with trade-only rules";
-  } else if (kind === "stop-bot") {
-    const stop = await buildStopBotCall(safe, roles);
-    if (!stop) throw new HttpError(400, "The bot is already stopped.");
-    call = { ...stop, value: 0n, operation: 0 };
+  if (kind === "stop-bot") {
+    if (!info.botEnabled) throw new HttpError(400, "The bot is already stopped.");
+    execution = stopBotExecution();
     summary = "Stop the bot";
   } else if (kind === "withdraw") {
     const asset = token === config.nativeSymbol ? { symbol: config.nativeSymbol, decimals: 18 } : TOKENS[token];
@@ -101,38 +158,37 @@ export async function prepareWalletAction(owner, { kind, token, amount }) {
     const balance = info.balances[asset.symbol];
     const value = amount === "max" ? balance : parseUnits(String(amount ?? ""), asset.decimals);
     if (value <= 0n) throw new HttpError(400, "Enter an amount greater than zero.");
-    if (value > balance) throw new HttpError(400, `The bot wallet only holds ${formatUnits(balance, asset.decimals)} ${asset.symbol}.`);
+    if (value > balance) throw new HttpError(400, `The smart account only holds ${formatUnits(balance, asset.decimals)} ${asset.symbol}.`);
     // Withdrawals always go to the owner's MetaMask. The backend never offers any other recipient.
-    call =
-      asset.symbol === config.nativeSymbol
-        ? { to: owner, value, data: "0x", operation: 0 }
-        : {
-            to: asset.address,
-            value: 0n,
-            data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [owner, value] }),
-            operation: 0,
-          };
+    execution = withdrawExecution(owner, asset, value);
     summary = `Withdraw ${formatUnits(value, asset.decimals)} ${asset.symbol} to ${short(owner)}`;
   } else {
     throw new HttpError(400, `Unknown wallet action "${kind}".`);
   }
 
-  const safeTx = await buildSafeTx(safe, call);
+  const tx = ownerActionTx(user.ownerDelegation, execution);
   const id = randomUUID();
-  await walletActions.create({ id, owner, safeAddress: safe, kind, summary, safeTx });
-  return { id, kind, summary, typedData: JSON.parse(toJson(safeTxTypedData(safe, safeTx))) };
+  await walletActions.create({ id, owner, account, kind, summary, tx });
+  return asJson({ id, kind, summary, tx });
 }
 
 /** Records a wallet action the user sent from MetaMask, after checking the transaction on-chain. */
 export async function confirmWalletAction(owner, id, txHash) {
   const action = await walletActions.claimForConfirm(id, owner);
-  if (!action) {
+  if (!action || !action.tx) {
     const existing = await walletActions.find(id, owner);
     if (!existing) throw new HttpError(404, "Wallet action not found.");
     throw new HttpError(400, `This action is already ${existing.status}.`);
   }
   try {
-    await confirmSafeTx(getAddress(action.safeAddress), owner, action.safeTx, txHash);
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
+    const transaction = await publicClient.getTransaction({ hash: txHash });
+    if (receipt.status !== "success") throw new HttpError(400, "That transaction failed on the blockchain.");
+    if (!sameAddress(transaction.from, owner)) throw new HttpError(400, "That transaction was not sent by the account owner.");
+    if (!transaction.to || !sameAddress(transaction.to, MM.delegationManager) || transaction.input.toLowerCase() !== action.tx.data.toLowerCase()) {
+      throw new HttpError(400, "That transaction does not match this wallet action.");
+    }
+    if (action.kind === "stop-bot") await users.setBotDelegation(owner, null);
     await walletActions.finish(id, "executed", { txHash });
     return { txHash };
   } catch (error) {
@@ -143,14 +199,18 @@ export async function confirmWalletAction(owner, id, txHash) {
 
 /** Runs one swap for a user and records the result. Used by the strategy runner and by test trades. */
 export async function tradeForUser(owner, { sell, amountIn, source }) {
-  const { safe, roles } = await requireWallet(owner);
+  const { user, account } = await requireAccount(owner);
   const tokenIn = TOKENS[sell];
   if (!tokenIn) throw new HttpError(400, `The bot can only sell ${Object.keys(TOKENS).join(" or ")}.`);
   const tokenOut = otherToken(tokenIn.symbol);
-  const base = { owner, safeAddress: safe, tokenIn: tokenIn.symbol, tokenOut: tokenOut.symbol, amountIn, source };
+  const delegation = user.botDelegation?.delegation;
+  if (!delegation || !(await isBotDelegationLive(account, delegation))) throw new HttpError(400, "The bot is not enabled.");
+
+  const base = { owner, account, tokenIn: tokenIn.symbol, tokenOut: tokenOut.symbol, amountIn, source };
   try {
-    const result = await executeSwap({ safe, roles, tokenIn, tokenOut, amountIn });
-    await trades.record({ ...base, minOut: result.minOut, amountOut: result.amountOut, fee: result.fee, txHash: result.swapTxHash, status: "success" });
+    const soldToday = await trades.soldInLastDay(owner, tokenIn.symbol);
+    const result = await executeSwap({ account, delegation, tokenIn, tokenOut, amountIn, soldToday });
+    await trades.record({ ...base, minOut: result.minOut, amountOut: result.amountOut, gasFee: result.gasFee, txHash: result.txHash, status: "success" });
     return { ...result, tokenIn: tokenIn.symbol, tokenOut: tokenOut.symbol };
   } catch (error) {
     await trades.record({ ...base, status: "failed", error: describeError(error).message });

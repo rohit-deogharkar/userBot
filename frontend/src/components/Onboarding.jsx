@@ -1,7 +1,7 @@
 const STEPS = [
   { key: "connect", title: "Connect MetaMask", text: "Your existing account works as it is." },
   { key: "signin", title: "Sign in", text: "One free signature proves the account is yours." },
-  { key: "create", title: "Create your bot wallet", text: "One MetaMask transaction, and you pay the small network fee. Your MetaMask is its only owner." },
+  { key: "create", title: "Create your smart account", text: "One MetaMask transaction plus one free signature. Your MetaMask is its only owner." },
 ];
 
 export default function Onboarding({ hasMetaMask, ready, account, signedIn, loadingWallet, busy, onConnect, onSignIn, onCreateWallet }) {
@@ -13,8 +13,8 @@ export default function Onboarding({ hasMetaMask, ready, account, signedIn, load
         <p className="eyebrow">Automated DEOD trading on BNB Chain, without handing over your keys</p>
         <h1>Your money stays in a wallet only your MetaMask controls.</h1>
         <p className="lead">
-          The bot gets a trade-only permission. It can swap tokens inside your bot wallet, but it can never withdraw or send
-          them anywhere. You can stop it or withdraw at any time.
+          You get a MetaMask smart account for trading, and sign the bot a trade-only permission. It can swap tokens inside
+          that account, but it can never withdraw or send them anywhere. You can stop it or withdraw at any time.
         </p>
       </div>
 
@@ -50,7 +50,7 @@ export default function Onboarding({ hasMetaMask, ready, account, signedIn, load
           <p className="muted">Loading your account…</p>
         ) : (
           <button className="primary" disabled={busy} onClick={onCreateWallet}>
-            Create bot wallet
+            Create smart account
           </button>
         )}
       </div>

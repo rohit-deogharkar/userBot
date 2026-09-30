@@ -572,6 +572,10 @@ select {
   overflow-wrap: anywhere;
 }
 
+.warning-text {
+  color: var(--warn);
+}
+
 .dot {
   width: 8px;
   height: 8px;

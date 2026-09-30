@@ -3,11 +3,11 @@ import { allSymbols, explorerLink, formatToken, shortAddress, tradingSymbols } f
 
 export default function WalletCard({ config, owner, wallet }) {
   const [copied, setCopied] = useState(false);
-  const link = explorerLink(config, "address", wallet.safeAddress);
+  const link = explorerLink(config, "address", wallet.account);
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(wallet.safeAddress);
+      await navigator.clipboard.writeText(wallet.account);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -18,12 +18,12 @@ export default function WalletCard({ config, owner, wallet }) {
   return (
     <section className="card">
       <div className="card-head">
-        <h2>Bot wallet</h2>
+        <h2>Smart account</h2>
         <span className={`pill ${wallet.botEnabled ? "on" : "off"}`}>{wallet.botEnabled ? "Bot running" : "Bot stopped"}</span>
       </div>
 
       <div className="address-row">
-        <code className="mono selectable">{wallet.safeAddress}</code>
+        <code className="mono selectable">{wallet.account}</code>
         <button className="small" onClick={copy}>
           {copied ? "Copied" : "Copy"}
         </button>
@@ -34,7 +34,7 @@ export default function WalletCard({ config, owner, wallet }) {
         )}
       </div>
       <p className="muted small-text">
-        Owned only by your MetaMask <span className="mono">{shortAddress(owner)}</span>. A Safe smart wallet on {config.chain.name}.
+        A MetaMask smart account on {config.chain.name}, owned only by your MetaMask <span className="mono">{shortAddress(owner)}</span>.
       </p>
 
       <dl className="balances">
@@ -46,12 +46,19 @@ export default function WalletCard({ config, owner, wallet }) {
         ))}
       </dl>
 
-      {wallet.botEnabled && config.fees && (
-        <p className="muted small-text">
-          Bot network fees: {formatToken(config, config.fees.perTrade, "USDT")} USDT per trade, paid from this wallet.{" "}
-          <span className="num">{formatToken(config, wallet.feeRemainingToday, "USDT")}</span> USDT of today's{" "}
-          {formatToken(config, config.fees.dailyCap, "USDT")} USDT cap left.
+      {BigInt(wallet.balances[config.nativeSymbol] ?? 0) === 0n ? (
+        <p className="warning-text small-text">
+          Deposit a little {config.nativeSymbol}: in Deposit below, choose {config.nativeSymbol} as the token. The bot pays each
+          trade's gas from it, and can't trade without it.
         </p>
+      ) : (
+        wallet.botEnabled && (
+          <p className="muted small-text">
+            The bot pays each trade's gas from the {config.nativeSymbol} in this account.{" "}
+            <span className="num">{formatToken(config, wallet.gasBudgetLeftToday, config.nativeSymbol)}</span> {config.nativeSymbol} of
+            today's {formatToken(config, config.gas.dailyCap, config.nativeSymbol)} {config.nativeSymbol} gas limit left.
+          </p>
+        )
       )}
       {wallet.botEnabled && (
         <p className="muted small-text">
